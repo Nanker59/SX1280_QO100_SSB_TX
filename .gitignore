@@ -1,0 +1,20 @@
+# Build directory
+build/
+
+# IDE settings
+.vscode/
+
+# Backup files
+backup/
+
+# External dependencies (clone separately)
+external/
+
+# Compiled files
+*.o
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+*.dis
