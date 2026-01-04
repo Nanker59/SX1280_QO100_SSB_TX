@@ -7,9 +7,6 @@ build/
 # Backup files
 backup/
 
-# External dependencies (clone separately)
-external/
-
 # Compiled files
 *.o
 *.elf
