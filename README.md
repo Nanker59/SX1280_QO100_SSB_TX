@@ -15,8 +15,7 @@ SSB (Single Sideband) and digital modes transmitter for the 2.4 GHz band, design
 - 🎛️ **Real-time DSP** - Bandpass filter, equalizer, compressor
 - 🔧 **USB CDC configuration** - Serial port for parameter control
 - 🎯 **PPM correction** - Precise frequency tuning
-- ⏱️ **Beacon mode** - Automatic CW when USB disconnected (after 10s)
-- 🔬 **Two-tone test** - For linearity adjustment
+- ⏱️ **Carrier mode** - Automatic CW when USB disconnected (after 10s)
 
 ## Author
 
@@ -45,7 +44,7 @@ GPIO 18 (SPI0 SCK) ───────── SCK
 GPIO 19 (SPI0 TX)  ───────── MOSI
 GPIO 20            ───────── RESET
 GPIO 21            ───────── BUSY
-GPIO 22            ───────── TCXO_EN (CRITICAL!)
+GPIO 22            ───────── TCXO_EN
 GPIO 14            ───────── RX_EN
 GPIO 15            ───────── TX_EN
 
@@ -62,9 +61,20 @@ The LoRa1280F27-TCXO module requires **TCXO_EN to be HIGH BEFORE SX1280 reset**!
 ## Building
 
 ### Requirements
-- Pico SDK 2.0+
+- [Raspberry Pi Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.0+ (or use VS Code Pico Extension)
 - CMake 3.13+
 - ARM GCC toolchain
+
+### Clone with submodules
+```bash
+git clone --recurse-submodules https://github.com/SP8ESA/SX1280_QO100_SSB_TX.git
+cd SX1280_QO100_SSB_TX
+```
+
+Or if already cloned:
+```bash
+git submodule update --init
+```
 
 ### Build
 ```bash
@@ -86,7 +96,7 @@ cp SX1280SDR.uf2 /media/$USER/RPI-RP2/
 2. Select "SX1280 QO-100 SSB TX" as audio output device
 3. Transmit using any software (SDR, WSJT-X, fldigi, etc.)
 
-### Beacon Mode
+### Carrier Mode
 If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
 
 ## CDC Commands
