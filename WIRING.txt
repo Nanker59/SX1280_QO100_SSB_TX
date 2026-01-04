@@ -1,11 +1,11 @@
 ================================================================================
-        SCHEMAT POŁĄCZEŃ: Raspberry Pi Pico ↔ LoRa1280F27-TCXO
+        WIRING DIAGRAM: Raspberry Pi Pico ↔ LoRa1280F27-TCXO
 ================================================================================
 
-ZASILANIE: Moduł zasilany z VBUS (5V) - wymaga podłączonego USB do Pico
+POWER SUPPLY: Module powered from VBUS (5V) - requires USB connected to Pico
 
 ================================================================================
-SCHEMAT WIZUALNY
+VISUAL DIAGRAM
 ================================================================================
 
          LoRa1280F27                          Raspberry Pi Pico
@@ -17,9 +17,9 @@ SCHEMAT WIZUALNY
    3    │  NRESET   │◄───────────────────────┤ GPIO20  (Pin 26) │
    4    │   BUSY    │───────────────────────►│ GPIO21  (Pin 27) │
         │           │                        │                  │
-   5    │   DIO1    │dio1 podłączony pod gpio5                  │
-   6    │   DIO2    │  (niepodłączony)       │                  │
-   7    │   DIO3    │  (niepodłączony)       │                  │
+   5    │   DIO1    │───────────────────────►│ GPIO5            │
+   6    │   DIO2    │  (not connected)       │                  │
+   7    │   DIO3    │  (not connected)       │                  │
         │           │                        │                  │
    8    │    NSS    │◄───────────────────────┤ GPIO17  (Pin 22) │
    9    │    SCK    │◄───────────────────────┤ GPIO18  (Pin 24) │
@@ -34,15 +34,15 @@ SCHEMAT WIZUALNY
   15    │    GND    │◄───────────────────────┤ GND              │
   16    │    GND    │◄───────────────────────┤ GND              │
         │           │                        │                  │
-  17    │    ANT    │────► Antena 2.4GHz     │                  │
+  17    │    ANT    │────► 2.4GHz Antenna    │                  │
   18    │    GND    │◄───────────────────────┤ GND              │
         │           │                        │                  │
         └───────────┘                        └──────────────────┘
 
 ================================================================================
-WERSJA LoRa1280F27-TCXO (DODATKOWE POŁĄCZENIE)
+LoRa1280F27-TCXO VERSION (ADDITIONAL CONNECTION)
 ================================================================================
-LoRa1280F27-TCXO    Nazwa      Pi Pico       Pi Pico
+LoRa1280F27-TCXO    Name       Pi Pico       Pi Pico
       Pin                       GPIO           Pin
 --------------------------------------------------------------
        2           TCXOEN      GPIO 22       Pin 29
