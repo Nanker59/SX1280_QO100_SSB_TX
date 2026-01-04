@@ -22,17 +22,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// ==========================================================
-// JITTER-REDUCED SSB (EXPERIMENTAL ARCHITECTURE)
-//
-// Core0: computes blocks of commands (freq steps, power, tx_on)
-// Core1: applies them at a fixed cadence (8 kHz)
-//
-// IMPORTANT FIX:
-//  - Consumer must NOT free a block before finishing playback,
-//    otherwise producer can overwrite it mid-play => "stukanie"/glitches.
-// ==========================================================
-
 // ================== MODE ==================
 #define FIXED_POWER_CW_MODE     0
 #define FIXED_TX_POWER_DBM      (13)
@@ -106,7 +95,7 @@ static const uint32_t PIN_RESET = 20;
 static const uint32_t PIN_BUSY  = 21;
 
 #if USE_TCXO_MODULE
-static const uint32_t PIN_TCXO_EN = 22;  // GPIO22 for TCXO enable (connect to module pin 2)
+static const uint32_t PIN_TCXO_EN = 22;
 #endif
 
 // ---------------- SPI config ----------------
@@ -132,7 +121,11 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 
 #define RAMP_TIME           0xE0     // 20 us
 
-// --- Hilbert transformer ---
+// --- Runtime RF config (adjustable via CDC) ---
+static volatile uint32_t g_center_freq_hz = BASE_FREQ_HZ;
+static volatile float g_ppm_correction = 0.0f;
+
+// --- Hilbert ---
 #define HILBERT_TAPS        247
 
 // --- PLL step ---
@@ -161,7 +154,7 @@ static volatile uint32_t g_prod_block = 0;
 static volatile uint32_t g_cons_block = 0;
 static volatile uint8_t  g_block_ready[NUM_BLOCKS] = {0};
 static volatile uint32_t g_underruns = 0;
-static volatile uint8_t  g_core1_start = 0;  // Signal for Core1 to start consuming
+static volatile uint8_t  g_core1_start = 0; 
 
 // ==========================================================
 // USB AUDIO IN (from PC) -> ringbuffer -> resampler to 8k mono
@@ -502,6 +495,17 @@ static inline void sx_set_rf_frequency_steps(uint32_t steps) {
 
 static inline uint32_t hz_to_steps(uint32_t freq_hz) {
     return (uint32_t)((double)freq_hz / (double)PLL_STEP_HZ);
+}
+
+// Convert Hz to steps with PPM correction applied
+static inline uint32_t hz_to_steps_with_ppm(uint32_t freq_hz, float ppm) {
+    double corrected_hz = (double)freq_hz * (1.0 + ppm / 1000000.0);
+    return (uint32_t)(corrected_hz / (double)PLL_STEP_HZ);
+}
+
+// Get current base steps with PPM correction
+static inline uint32_t get_base_steps(void) {
+    return hz_to_steps_with_ppm(g_center_freq_hz, g_ppm_correction);
 }
 
 // Get SX1280 status byte
@@ -953,12 +957,14 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
+        "  freq=%lu Hz  ppm=%.2f\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f\r\n"
         "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
+        (unsigned long)g_center_freq_hz, g_ppm_correction,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz,
         c.eq_low_hz, c.eq_low_db,
@@ -973,9 +979,11 @@ static void cmd_help(void) {
         "Commands:\r\n"
         "  help\r\n"
         "  get\r\n"
-        "  diag        - show SX1280 status\r\n"
-        "  cw          - start CW test transmission\r\n"
-        "  stop        - stop CW transmission\r\n"
+        "  diag          - show SX1280 status\r\n"
+        "  cw            - start CW test transmission\r\n"
+        "  stop          - stop CW transmission\r\n"
+        "  freq <Hz>     - set center frequency (e.g. freq 2400100000)\r\n"
+        "  ppm <value>   - set PPM correction (e.g. ppm -1.5)\r\n"
         "  enable <bp|eq|comp> <0|1|on|off>\r\n"
         "  set bp_lo <Hz>\r\n"
         "  set bp_hi <Hz>\r\n"
@@ -993,7 +1001,7 @@ static void cmd_help(void) {
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
         "\r\n"
-        "Notes: changes apply at next BLOCK boundary.\r\n"
+        "Notes: freq/ppm changes apply immediately.\r\n"
     );
 }
 
@@ -1018,6 +1026,39 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
     if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
     if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
+
+    // Frequency command: freq <Hz>
+    if (streqi(argv[0], "freq") && argc >= 2) {
+        char *e = NULL;
+        unsigned long f = strtoul(argv[1], &e, 10);
+        if (e == argv[1] || f < 2400000000UL || f > 2500000000UL) {
+            cdc_write_str("ERR: freq must be 2400000000-2500000000 Hz\r\n");
+            return;
+        }
+        g_center_freq_hz = (uint32_t)f;
+        cdc_printf("OK freq=%lu Hz (steps=%lu)\r\n", 
+                   (unsigned long)g_center_freq_hz, 
+                   (unsigned long)get_base_steps());
+        return;
+    }
+
+    // PPM correction command: ppm <value>
+    if (streqi(argv[0], "ppm") && argc >= 2) {
+        float ppm;
+        if (!parse_f(argv[1], &ppm)) { 
+            cdc_write_str("ERR: bad PPM value\r\n"); 
+            return; 
+        }
+        if (ppm < -100.0f || ppm > 100.0f) {
+            cdc_write_str("ERR: ppm must be -100 to +100\r\n");
+            return;
+        }
+        g_ppm_correction = ppm;
+        cdc_printf("OK ppm=%.2f (steps=%lu)\r\n", 
+                   g_ppm_correction, 
+                   (unsigned long)get_base_steps());
+        return;
+    }
 
     audio_cfg_t c;
     __compiler_memory_barrier();
@@ -1363,9 +1404,9 @@ int main(void) {
 
     sx_set_packet_type_gfsk();
 
-    const uint32_t base_steps_u = hz_to_steps(BASE_FREQ_HZ);
-    const int32_t base_steps = (int32_t)base_steps_u;
-    sx_set_rf_frequency_steps((uint32_t)base_steps);
+    // Use runtime-configurable frequency with PPM correction
+    uint32_t init_base_steps = get_base_steps();
+    sx_set_rf_frequency_steps(init_base_steps);
 
     sx_set_tx_params_dbm((int32_t)PWR_MIN_DBM);  // Start with minimum power
     // TX_EN stays LOW - will be controlled by Core1 or CDC commands
@@ -1382,7 +1423,48 @@ int main(void) {
     while (true) { tud_task(); tight_loop_contents(); }
 #endif
 
-    hilbert_init();
+    // *** USB TIMEOUT: If no USB connection within 10 seconds, start beacon CW on 2400.3 MHz ***
+    {
+        const uint32_t USB_TIMEOUT_MS = 10000;
+        const uint32_t BEACON_FREQ_HZ = 2400300000u;
+        
+        printf("[BOOT] Waiting for USB connection (timeout %lu ms)...\n", (unsigned long)USB_TIMEOUT_MS);
+        
+        absolute_time_t deadline = make_timeout_time_ms(USB_TIMEOUT_MS);
+        
+        while (!tud_ready()) {
+            tud_task();
+            
+            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+                // Timeout! Start beacon mode
+                printf("[BOOT] USB timeout - starting beacon CW on %.3f MHz\n", 
+                       (float)BEACON_FREQ_HZ / 1000000.0f);
+                
+                g_center_freq_hz = BEACON_FREQ_HZ;
+                g_ppm_correction = 0.0f;
+                
+                sx_set_rf_frequency_steps(get_base_steps());
+                sx_set_tx_params_dbm((int32_t)PWR_MAX_DBM);
+                gpio_put(PIN_TX_EN, 1);
+                sx_start_tx_continuous_wave();
+                
+                // Stay in beacon mode forever (or until power cycle)
+                while (true) {
+                    tud_task();
+                    sleep_ms(100);
+                    
+                    // If USB connects later, could optionally exit beacon mode
+                    // For now, stay in CW beacon
+                }
+            }
+            
+            sleep_ms(10);
+        }
+        
+        printf("[BOOT] USB connected, starting normal SSB mode\n");
+    }
+
+    hilbert_init();;
 
     const float Fs = (float)WAV_SAMPLE_RATE;
 
@@ -1485,6 +1567,9 @@ int main(void) {
         memcpy(&cfg_local, (const void*)&g_cfg, sizeof(cfg_local));
         __compiler_memory_barrier();
 #endif
+
+        // Get current base steps (with freq and PPM correction) at block boundary
+        int32_t base_steps = (int32_t)get_base_steps();
 
         sample_cmd_t *blk = g_blocks[b];
 

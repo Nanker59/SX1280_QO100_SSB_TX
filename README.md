@@ -6,27 +6,17 @@
 
 Demo nadajnika SSB (Single Sideband) i sygnałów cyfrowych na pasmo 2.4 GHz, przeznaczonego do łączności przez transponder wąskopasmowy satelity geostatycznego **QO-100 (Es'hail 2)**.
 
-Projekt wykorzystuje:
-- **Raspberry Pi Pico 2** (RP2350) jako główny kontroler
-- **Moduł LoRa1280F27-TCXO** (SX1280 + PA + TCXO) jako źródło RF
-- **USB Audio Class 1** do przyjmowania audio z komputera (48 kHz stereo → 8 kHz mono)
-- **Transformatę Hilberta** do generacji sygnału SSB (USB)
-- **Modulację FM** z ditherowaną mocą wyjściową
-
 ### Funkcje
 
-- Transmisja SSB (Upper Sideband) na częstotliwości 2400.050 - 2400.300 MHz
-- Przetwarzanie audio: filtr pasmowy 300-2700 Hz, equalizator, kompresor
-- Adaptive resampling z interpolacją kubiczną Hermite'a
-- Test dwutonowy (1000 Hz + 1900 Hz) do kalibracji
-- Test CW do weryfikacji toru RF
+- Transmisja SSB (Upper Sideband) na częstotliwości 2400.000 - 2400.500 MHz
+- Przetwarzanie audio: filtr pasmowy 300-2700 Hz, equalizer, kompresor
 - Konfiguracja przez USB CDC (port szeregowy)
 
 ## Autor
 
-**Kacper SP8ESA**
+**Kacper Kidała SP8ESA**
 
-Kod w całości wygenerowany przy pomocy **Claude Opus 4** (Anthropic).
+Kod wygenerowany przy pomocy **Claude Opus 4.5** i **GPT 5.2** .
 
 ## Schemat połączeń
 
@@ -52,69 +42,71 @@ USB                ───────── Do komputera (Audio + CDC)
 ### WAŻNE - Moduł TCXO
 
 Moduł LoRa1280F27-TCXO wymaga **włączenia TCXO_EN PRZED resetem SX1280**!
-Sekwencja inicjalizacji:
-1. TCXO_EN = HIGH
-2. Odczekaj min. 3 ms
-3. Reset SX1280 (pulse LOW)
-4. Użyj SetStandby(STDBY_XOSC) zamiast STDBY_RC
-
-## Kompilacja
-
-### Wymagania
-- Pico SDK 2.2.0+
-- CMake 3.13+
-- ARM GCC toolchain
-
-### Budowanie
-
-```bash
-mkdir build && cd build
-cmake .. -G Ninja
-ninja
-```
-
-### Programowanie
-
-```bash
-picotool load SX1280SDR.elf -fx
-```
 
 ## Komendy CDC
 
 Po podłączeniu USB dostępny jest port szeregowy z komendami:
 
+### Komendy podstawowe
+
 | Komenda | Opis |
 |---------|------|
 | `help` | Lista komend |
-| `diag` | Diagnostyka SX1280 i buforów |
 | `get` | Pokaż aktualną konfigurację |
+| `diag` | Diagnostyka SX1280 i buforów |
 | `cw` | Start testu CW |
-| `stop` | Stop transmisji |
+| `stop` | Stop transmisji CW |
+
+### Konfiguracja częstotliwości
+
+| Komenda | Opis |
+|---------|------|
+| `freq <Hz>` | Ustaw częstotliwość centralną (np. `freq 2400100000`) |
+| `ppm <value>` | Korekcja PPM oscylatora (np. `ppm -1.5`) |
+
+### Włączanie/wyłączanie bloków DSP
+
+| Komenda | Opis |
+|---------|------|
 | `enable bp 0/1` | Włącz/wyłącz filtr pasmowy |
 | `enable eq 0/1` | Włącz/wyłącz equalizator |
 | `enable comp 0/1` | Włącz/wyłącz kompresor |
-| `set bp_lo <Hz>` | Dolna częstotliwość filtru |
-| `set bp_hi <Hz>` | Górna częstotliwość filtru |
+
+### Ustawienia filtru pasmowego
+
+| Komenda | Opis |
+|---------|------|
+| `set bp_lo <Hz>` | Dolna częstotliwość filtru (domyślnie 300 Hz) |
+| `set bp_hi <Hz>` | Górna częstotliwość filtru (domyślnie 2700 Hz) |
+
+### Ustawienia equalizera
+
+| Komenda | Opis |
+|---------|------|
+| `set eq_low_hz <Hz>` | Częstotliwość niskiego pasma |
+| `set eq_low_db <dB>` | Wzmocnienie niskiego pasma |
+| `set eq_high_hz <Hz>` | Częstotliwość wysokiego pasma |
+| `set eq_high_db <dB>` | Wzmocnienie wysokiego pasma |
+
+### Ustawienia kompresora
+
+| Komenda | Opis |
+|---------|------|
 | `set comp_thr <dB>` | Próg kompresora |
 | `set comp_ratio <n>` | Współczynnik kompresji |
+| `set comp_att <ms>` | Czas ataku |
+| `set comp_rel <ms>` | Czas powrotu |
+| `set comp_makeup <dB>` | Wzmocnienie makeup |
+| `set comp_knee <dB>` | Szerokość knee |
+| `set comp_outlim <0..1>` | Limiter wyjściowy |
 
-## Konfiguracja
+### Ustawienia wzmacniacza
 
-Główne parametry w `main.c`:
+| Komenda | Opis |
+|---------|------|
+| `set amp_gain <float>` | Wzmocnienie końcowe |
+| `set amp_min_a <float>` | Minimalna amplituda
 
-```c
-#define USE_TCXO_MODULE     1       // 1 dla modułu z TCXO
-#define CENTER_FREQ_HZ      2400100000ULL  // Częstotliwość nośna
-#define PWR_MAX_DBM         13      // Max moc (dBm do PA)
-#define WAV_SAMPLE_RATE     8000    // Częstotliwość próbkowania DSP
-
-#define USE_TEST_TONE       0       // 1 = test tonowy zamiast USB audio
-#define USE_TWO_TONE_TEST   1       // 1 = dwuton, 0 = jednoton
-```
-
-## Licencja
-
-MIT License - użycie na własną odpowiedzialność.
 
 ## Ostrzeżenie
 

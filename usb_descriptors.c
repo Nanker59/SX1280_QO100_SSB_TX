@@ -190,11 +190,11 @@ enum {
 static char const *string_desc_arr[] =
 {
   (const char[]) { 0x09, 0x04 },        // 0: English (0x0409)
-  "TinyUSB",                            // 1: Manufacturer
-  "TinyUSB Speaker (UAC1) + CDC",       // 2: Product
+  "SP8ESA",                             // 1: Manufacturer
+  "SX1280 QO-100 SSB TX",               // 2: Product
   NULL,                                 // 3: Serial (generated)
-  "CDC Console",                        // 4: CDC interface string
-  "UAC1 Speaker",                       // 5: UAC1 (optional use)
+  "SSB TX Console",                     // 4: CDC interface string
+  "SSB Audio Input",                    // 5: UAC1 (optional use)
 };
 
 static uint16_t _desc_str[32 + 1];
