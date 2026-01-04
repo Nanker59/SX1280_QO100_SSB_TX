@@ -38,7 +38,6 @@ extern "C" {
 
 #define CFG_TUD_ENABLED       1
 
-// WYMUSZAMY Full-Speed (UAC1, max kompatybilność)
 #define CFG_TUD_MAX_SPEED     OPT_MODE_FULL_SPEED
 
 #ifndef CFG_TUSB_MEM_SECTION

@@ -68,14 +68,6 @@ uint8_t const * tud_hid_descriptor_report_cb(uint8_t itf)
 }
 #endif
 
-//--------------------------------------------------------------------+
-// Endpoint numbers
-//--------------------------------------------------------------------+
-//
-// Audio: ISO OUT + FB IN (zwyczajowo ten sam numer EP, IN ma bit 0x80)
-// CDC:   1x NOTIF IN, 1x BULK OUT, 1x BULK IN
-// HID:   1x IN (opcjonalnie)
-
 #if CFG_TUSB_MCU == OPT_MCU_LPC175X_6X || CFG_TUSB_MCU == OPT_MCU_LPC177X_8X || CFG_TUSB_MCU == OPT_MCU_LPC40XX
   #define EPNUM_AUDIO         0x03
   #define EPNUM_AUDIO_FB      0x03
@@ -108,7 +100,6 @@ uint8_t const * tud_hid_descriptor_report_cb(uint8_t itf)
   #define EPNUM_DEBUG         0x05
 
 #else
-  // Typowe dla RP2040: weź audio na 0x01, CDC na 0x02/0x82/0x83, debug na 0x84
   #define EPNUM_AUDIO         0x01
   #define EPNUM_AUDIO_FB      0x01
 
@@ -193,7 +184,7 @@ static char const *string_desc_arr[] =
   "SP8ESA",                             // 1: Manufacturer
   "SX1280 QO-100 SSB TX",               // 2: Product
   NULL,                                 // 3: Serial (generated)
-  "SSB TX Console",                     // 4: CDC interface string
+  "TX Console",                     // 4: CDC interface string
   "SSB Audio Input",                    // 5: UAC1 (optional use)
 };
 

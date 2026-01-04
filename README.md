@@ -10,12 +10,12 @@ SSB (Single Sideband) and digital modes transmitter for the 2.4 GHz band, design
 
 ### Features
 
-- 📻 **USB Audio** - Pico acts as USB sound card, audio input directly from computer
-- 📡 **Output power up to +27 dBm** - Built-in PA in LoRa1280F27 module
-- 🎛️ **Real-time DSP** - Bandpass filter, equalizer, compressor
-- 🔧 **USB CDC configuration** - Serial port for parameter control
-- 🎯 **PPM correction** - Precise frequency tuning
-- ⏱️ **Carrier mode** - Automatic CW when USB disconnected (after 10s)
+- **USB Audio** - Pico acts as USB sound card, audio input directly from computer
+- **Output power up to +27 dBm** - Built-in PA in LoRa1280F27 module
+- **Real-time DSP** - Bandpass filter, equalizer, compressor
+- **USB CDC configuration** - Serial port for parameter control
+- **PPM correction** - Precise frequency tuning
+- **Carrier mode** - Automatic CW when USB disconnected (after 10s)
 
 ## Author
 
@@ -181,7 +181,7 @@ QO-100 Narrowband Transponder:
 
 ## Warning
 
-⚠️ **Transmission on 2.4 GHz requires appropriate radio license!**
+**Transmission on 2.4 GHz requires appropriate radio license!**
 
 Make sure you have a valid amateur radio license and comply with regulations in your country.
 
@@ -189,9 +189,9 @@ Make sure you have a valid amateur radio license and comply with regulations in 
 
 This project is licensed under **CC BY-NC 4.0** (Creative Commons Attribution-NonCommercial).
 
-- ✅ Non-commercial use (including amateur radio)
-- ✅ Modifications allowed
-- ❌ Commercial use requires author's permission
+- Non-commercial use (including amateur radio) - OK
+- Modifications allowed - OK
+- Commercial use requires author's permission
 
 This project uses:
 - [TinyUSB](https://github.com/hathach/tinyusb) - MIT License
@@ -199,4 +199,4 @@ This project uses:
 
 ---
 
-73 de SP8ESA 📻🛰️
+73 de SP8ESA
