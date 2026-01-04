@@ -180,7 +180,6 @@ uint32_t steps = (uint32_t)(base_steps * ppm_factor);
 
 - Uplink: 2400.050 - 2400.300 MHz
 - Downlink: 10489.550 - 10489.800 MHz
-- Offset: 8089.5 MHz
 
 ## Common Issues
 
