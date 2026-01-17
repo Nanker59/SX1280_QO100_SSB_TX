@@ -68,10 +68,10 @@
 // ================== COMPRESSION (default values) ==================
 #define AUDIO_ENABLE_COMPRESSOR     1
 #define COMP_THRESHOLD_DB           (-18.0f)
-#define COMP_RATIO                  (3.0f)
+#define COMP_RATIO                  (1.0f)   // 1.0 = no compression, volume controls TX power
 #define COMP_ATTACK_MS              (8.0f)
 #define COMP_RELEASE_MS             (120.0f)
-#define COMP_MAKEUP_DB              (6.0f)
+#define COMP_MAKEUP_DB              (0.0f)   // 0 = no makeup gain
 #define COMP_KNEE_DB                (6.0f)
 #define COMP_OUTPUT_LIMIT           (0.98f)
 // ===============================================
@@ -116,7 +116,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 #define PWR_MAX_DBM         (13)
 #define PWR_MIN_DBM         (-18)
 
-#define AMP_GAIN            5.f
+#define AMP_GAIN            1.0f    // 1.0 = no boost, volume slider controls TX power directly
 #define AMP_MIN_A           0.000002f
 
 #define RAMP_TIME           0xE0     // 20 us
@@ -124,6 +124,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 // --- Runtime RF config (adjustable via CDC) ---
 static volatile uint32_t g_center_freq_hz = BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
+static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -574,6 +575,10 @@ static void sx_test_cw(void) {
 #if CFG_TUD_CDC
     cdc_printf("\r\n*** Starting CW test ***\r\n");
     
+    // Signal Core1 to stop SPI operations
+    g_cw_test_mode = 1;
+    sleep_ms(10);  // Wait for Core1 to see flag and stop
+    
     // Ensure TCXO is on
 #if USE_TCXO_MODULE
     gpio_put(PIN_TCXO_EN, 1);
@@ -594,10 +599,10 @@ static void sx_test_cw(void) {
     sx_set_packet_type_gfsk();
     cdc_printf("Packet: GFSK\r\n");
     
-    // Frequency
-    uint32_t steps = hz_to_steps(BASE_FREQ_HZ);
+    // Frequency - use current center freq
+    uint32_t steps = hz_to_steps_with_ppm(g_center_freq_hz, g_ppm_correction);
     sx_set_rf_frequency_steps(steps);
-    cdc_printf("Freq: %lu Hz\r\n", (unsigned long)BASE_FREQ_HZ);
+    cdc_printf("Freq: %lu Hz\r\n", (unsigned long)g_center_freq_hz);
     
     // Max power
     sx_set_tx_params_dbm(PWR_MAX_DBM);
@@ -610,6 +615,7 @@ static void sx_test_cw(void) {
     
     // Start CW
     sx_start_tx_continuous_wave();
+    sleep_ms(5);  // Give chip time to start TX
     uint8_t status = sx_get_status();
     cdc_printf("Status after CW: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
     
@@ -631,6 +637,9 @@ static void sx_stop_cw(void) {
     sx_set_standby_rc();
 #endif
     cdc_printf("TX stopped, back to standby\r\n");
+    
+    // Resume normal Core1 operation
+    g_cw_test_mode = 0;
 #endif
 }
 
@@ -1228,6 +1237,12 @@ static void core1_radio_apply_loop(void) {
     bool tx_en_activated = false;  // Track if we've enabled the PA
 
     while (true) {
+        // If CW test mode is active, skip SPI operations
+        if (g_cw_test_mode) {
+            sleep_ms(10);
+            continue;
+        }
+
         uint32_t b = g_cons_block;
 
         if (!g_block_ready[b]) {
