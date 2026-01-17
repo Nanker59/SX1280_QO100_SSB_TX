@@ -3,15 +3,14 @@
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+#include "pico/unique_id.h"
 
 #if CFG_AUDIO_DEBUG
 #include "common_types.h"
 #endif
 
-/* PID bitmap */
-#define PID_MAP(itf, n)  ((CFG_TUD_##itf) ? (1 << (n)) : 0)
-#define USB_PID (0x4000 | PID_MAP(CDC, 0) | PID_MAP(MSC, 1) | PID_MAP(HID, 2) | \
-                          PID_MAP(MIDI, 3) | PID_MAP(AUDIO, 4) | PID_MAP(VENDOR, 5))
+/* Unique PID for SX1280 QO-100 SSB TX project */
+#define USB_PID  0x4073  // 'QO' in hex (0x51 0x4F -> 0x4073 unique)
 
 //--------------------------------------------------------------------+
 // Device Descriptor
@@ -201,7 +200,16 @@ uint16_t const * tud_descriptor_string_cb(uint8_t index, uint16_t langid)
       break;
 
     case STRID_SERIAL:
-      chr_count = board_usb_get_serial(_desc_str + 1, 32);
+      {
+        // Use Pico's unique board ID for truly unique serial number
+        char serial_str[PICO_UNIQUE_BOARD_ID_SIZE_BYTES * 2 + 1];
+        pico_get_unique_board_id_string(serial_str, sizeof(serial_str));
+        chr_count = strlen(serial_str);
+        if (chr_count > 31) chr_count = 31;
+        for (size_t i = 0; i < chr_count; i++) {
+          _desc_str[1 + i] = serial_str[i];
+        }
+      }
       break;
 
     default:
