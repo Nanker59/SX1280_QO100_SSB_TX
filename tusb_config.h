@@ -98,10 +98,9 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX      2
 #define CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX              16
 
-// UAC1 Full-Speed endpoint size
+// UAC1 Full-Speed endpoint size: 48kHz * 2ch * 2bytes / 1000 = 192 bytes per frame
 #define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE_FS     48000
-#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_FS           TUD_AUDIO_EP_SIZE(false, CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE_FS, \
-                                                  CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX, CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX)
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_FS           192
 
 // Provide compatibility define expected by newer audio_device.h
 #ifndef CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX
@@ -111,9 +110,9 @@ extern "C" {
 // FIFO / SW buffer
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (4 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_FS)
 
-// Enable OUT EP + Feedback EP
+// Enable OUT EP, DISABLE feedback EP (Windows compatible)
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT                 1
-#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            1
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            0
 
 #ifdef __cplusplus
 }

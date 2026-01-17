@@ -420,6 +420,7 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
     }
 }
 
+#if CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
 // Feedback method (dla UAC1 speaker+feedback)
 void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedback_params_t *feedback_param) {
     (void)func_id;
@@ -427,6 +428,7 @@ void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedba
     feedback_param->method = AUDIO_FEEDBACK_METHOD_FIFO_COUNT;
     feedback_param->sample_freq = g_usb_sample_rate_hz ? g_usb_sample_rate_hz : 48000u;
 }
+#endif
 
 // ==========================================================
 // SX1280 low-level radio I/O (CORE1 ONLY)

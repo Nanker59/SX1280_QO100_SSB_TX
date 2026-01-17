@@ -115,9 +115,9 @@ uint8_t const * tud_hid_descriptor_report_cb(uint8_t itf)
 //--------------------------------------------------------------------+
 
 #if CFG_AUDIO_DEBUG
-  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO10_SPEAKER_STEREO_FB_DESC_LEN(2) + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
+  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESC_LEN(1) + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
 #else
-  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO10_SPEAKER_STEREO_FB_DESC_LEN(2) + TUD_CDC_DESC_LEN)
+  #define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESC_LEN(1) + TUD_CDC_DESC_LEN)
 #endif
 
 uint8_t const desc_configuration[] =
@@ -126,17 +126,15 @@ uint8_t const desc_configuration[] =
   // Attribute: 0x80 = bus powered
   TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x80, 100),
 
-  // ---- UAC1 Speaker stereo + feedback, sample rates 44.1k + 48k ----
-  // (stridx=2 wg Twojej tablicy stringów: "TinyUSB Speaker (UAC1)" / lub "UAC1 Speaker")
-  TUD_AUDIO10_SPEAKER_STEREO_FB_DESCRIPTOR(
+  // ---- UAC1 Speaker stereo (NO feedback - Windows compatible), 48kHz only ----
+  TUD_AUDIO10_SPEAKER_STEREO_NOFB_DESCRIPTOR(
     ITF_NUM_AUDIO_CONTROL,
     2,
       CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX,
       CFG_TUD_AUDIO_FUNC_1_RESOLUTION_RX,
       EPNUM_AUDIO,
       CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_FS,
-      (uint8_t)(EPNUM_AUDIO_FB | 0x80),
-      44100, 48000
+      48000
   ),
 
   // ---- CDC ACM (Serial) ----
