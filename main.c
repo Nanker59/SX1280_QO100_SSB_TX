@@ -54,26 +54,28 @@
 
 // ================== AUDIO SHAPING (default values) ==================
 #define AUDIO_ENABLE_BANDPASS       1
-#define AUDIO_BP_LO_HZ              300.0f
+#define AUDIO_BP_LO_HZ              200.0f
 #define AUDIO_BP_HI_HZ              2700.0f
-#define AUDIO_BP_CASCADE_STAGES     5
+#define AUDIO_BP_MAX_STAGES         10      // Max stages (compile-time allocation)
+#define AUDIO_BP_DEFAULT_STAGES     7       // Default stages (runtime adjustable, 1-10)
+// Each stage = 12 dB/octave, so 7 stages = 84 dB/oct, 10 stages = 120 dB/oct
 
 #define AUDIO_ENABLE_EQ             1
-#define EQ_LOW_SHELF_HZ             350.0f
-#define EQ_LOW_SHELF_DB             (-9.0f)
+#define EQ_LOW_SHELF_HZ             190.0f
+#define EQ_LOW_SHELF_DB             (-9.5f)
 #define EQ_HIGH_SHELF_HZ            1700.0f
-#define EQ_HIGH_SHELF_DB            (9.0f)
+#define EQ_HIGH_SHELF_DB            (13.5f)
 // ===============================================
 
 // ================== COMPRESSION (default values) ==================
 #define AUDIO_ENABLE_COMPRESSOR     1
-#define COMP_THRESHOLD_DB           (-18.0f)
-#define COMP_RATIO                  (1.0f)   // 1.0 = no compression, volume controls TX power
-#define COMP_ATTACK_MS              (8.0f)
-#define COMP_RELEASE_MS             (120.0f)
-#define COMP_MAKEUP_DB              (0.0f)   // 0 = no makeup gain
-#define COMP_KNEE_DB                (6.0f)
-#define COMP_OUTPUT_LIMIT           (0.98f)
+#define COMP_THRESHOLD_DB           (-12.5f)
+#define COMP_RATIO                  (6.1f)
+#define COMP_ATTACK_MS              (41.1f)
+#define COMP_RELEASE_MS             (1595.0f)
+#define COMP_MAKEUP_DB              (0.0f)
+#define COMP_KNEE_DB                (16.5f)
+#define COMP_OUTPUT_LIMIT           (0.312f)
 // ===============================================
 
 // ================== MODULE VARIANT ==================
@@ -116,7 +118,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 #define PWR_MAX_DBM         (13)
 #define PWR_MIN_DBM         (-18)
 
-#define AMP_GAIN            1.0f    // 1.0 = no boost, volume slider controls TX power directly
+#define AMP_GAIN            4.36f
 #define AMP_MIN_A           0.000002f
 
 #define RAMP_TIME           0xE0     // 20 us
@@ -136,7 +138,7 @@ static const float PLL_STEP_HZ =
 #define F_OFF_LIMIT_HZ      3500.0f
 #define SILENCE_SECONDS     2u
 
-#define GATE_A_REF          0.00005f
+#define GATE_A_REF          0.01f   // Noise gate threshold - higher with compressor
 #define GATE_SHAPE          1
 
 #define IQ_GAIN_CORR        1.00f
@@ -787,6 +789,7 @@ typedef struct {
 
     float bp_lo_hz;
     float bp_hi_hz;
+    uint8_t bp_stages;      // 1-10, each stage = 12 dB/octave
 
     float eq_low_hz;
     float eq_low_db;
@@ -810,8 +813,9 @@ static volatile audio_cfg_t g_cfg = {
     .enable_eq       = AUDIO_ENABLE_EQ,
     .enable_comp     = AUDIO_ENABLE_COMPRESSOR,
 
-    .bp_lo_hz = AUDIO_BP_LO_HZ,
-    .bp_hi_hz = AUDIO_BP_HI_HZ,
+    .bp_lo_hz  = AUDIO_BP_LO_HZ,
+    .bp_hi_hz  = AUDIO_BP_HI_HZ,
+    .bp_stages = AUDIO_BP_DEFAULT_STAGES,
 
     .eq_low_hz  = EQ_LOW_SHELF_HZ,
     .eq_low_db  = EQ_LOW_SHELF_DB,
@@ -829,7 +833,6 @@ static volatile audio_cfg_t g_cfg = {
     .amp_gain  = AMP_GAIN,
     .amp_min_a = AMP_MIN_A,
 };
-
 static volatile uint8_t g_cfg_dirty = 1;
 
 static void compressor_reconfig(compressor_t *c, float fs, const audio_cfg_t *cfg) {
@@ -867,6 +870,10 @@ static void cfg_sanitize(audio_cfg_t *c, float fs) {
 
     if (c->amp_gain < 0.01f) c->amp_gain = 0.01f;
     if (c->amp_min_a < 1e-9f) c->amp_min_a = 1e-9f;
+
+    // Clamp bp_stages to valid range
+    if (c->bp_stages < 1) c->bp_stages = 1;
+    if (c->bp_stages > AUDIO_BP_MAX_STAGES) c->bp_stages = AUDIO_BP_MAX_STAGES;
 }
 
 static void apply_cfg_if_dirty(float Fs,
@@ -884,8 +891,8 @@ static void apply_cfg_if_dirty(float Fs,
 
     cfg_sanitize(&tmp, Fs);
 
-#if AUDIO_BP_CASCADE_STAGES
-    for (int i = 0; i < AUDIO_BP_CASCADE_STAGES; i++) {
+#if AUDIO_BP_MAX_STAGES
+    for (int i = 0; i < AUDIO_BP_MAX_STAGES; i++) {
         biquad_init_highpass_bw2(&bp_hpf[i], tmp.bp_lo_hz, Fs);
         biquad_init_lowpass_bw2 (&bp_lpf[i], tmp.bp_hi_hz, Fs);
     }
@@ -904,7 +911,6 @@ static void apply_cfg_if_dirty(float Fs,
     g_cfg_dirty = 0;
     __compiler_memory_barrier();
 }
-
 // ==========================================================
 // Simple USB CDC command interface (enabled only if CDC exists)
 // ==========================================================
@@ -970,14 +976,14 @@ static void cfg_print(void) {
         "CFG:\r\n"
         "  freq=%lu Hz  ppm=%.2f\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
-        "  bp_lo=%.1f bp_hi=%.1f\r\n"
+        "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
         "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
         (unsigned long)g_center_freq_hz, g_ppm_correction,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
-        c.bp_lo_hz, c.bp_hi_hz,
+        c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
         c.eq_low_hz, c.eq_low_db,
         c.eq_high_hz, c.eq_high_db,
         c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms, c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit,
@@ -998,6 +1004,7 @@ static void cmd_help(void) {
         "  enable <bp|eq|comp> <0|1|on|off>\r\n"
         "  set bp_lo <Hz>\r\n"
         "  set bp_hi <Hz>\r\n"
+        "  set bp_stages <1-10>  (filter steepness: 12dB/oct per stage)\r\n"
         "  set eq_low_hz <Hz>\r\n"
         "  set eq_low_db <dB>\r\n"
         "  set eq_high_hz <Hz>\r\n"
@@ -1096,6 +1103,7 @@ static void cdc_handle_line(char *line) {
 
         if      (streqi(argv[1], "bp_lo"))       c.bp_lo_hz = f;
         else if (streqi(argv[1], "bp_hi"))       c.bp_hi_hz = f;
+        else if (streqi(argv[1], "bp_stages"))   c.bp_stages = (uint8_t)f;
         else if (streqi(argv[1], "eq_low_hz"))   c.eq_low_hz = f;
         else if (streqi(argv[1], "eq_low_db"))   c.eq_low_db = f;
         else if (streqi(argv[1], "eq_high_hz"))  c.eq_high_hz = f;
@@ -1496,8 +1504,8 @@ int main(void) {
     const float sphi = sinf(phi);
 
 #if AUDIO_ENABLE_BANDPASS
-    biquad_t bp_hpf[AUDIO_BP_CASCADE_STAGES];
-    biquad_t bp_lpf[AUDIO_BP_CASCADE_STAGES];
+    biquad_t bp_hpf[AUDIO_BP_MAX_STAGES];
+    biquad_t bp_lpf[AUDIO_BP_MAX_STAGES];
     // init via apply_cfg_if_dirty()
 #endif
 
@@ -1626,7 +1634,7 @@ int main(void) {
                 tx_acc = 0.0f;
 
 #if AUDIO_ENABLE_BANDPASS
-                for (int i = 0; i < AUDIO_BP_CASCADE_STAGES; i++) {
+                for (int i = 0; i < AUDIO_BP_MAX_STAGES; i++) {
                     biquad_reset(&bp_hpf[i]);
                     biquad_reset(&bp_lpf[i]);
                 }
@@ -1639,13 +1647,6 @@ int main(void) {
                 comp.env = 0.0f;
 #endif
                 silence_ctr = silence_samples + 1u;
-            }
-#endif
-
-#if AUDIO_ENABLE_BANDPASS
-            if (cfg_local.enable_bandpass) {
-                for (int i = 0; i < AUDIO_BP_CASCADE_STAGES; i++) x = biquad_process(&bp_hpf[i], x);
-                for (int i = 0; i < AUDIO_BP_CASCADE_STAGES; i++) x = biquad_process(&bp_lpf[i], x);
             }
 #endif
 
@@ -1662,6 +1663,13 @@ int main(void) {
                 // output limiter
                 if (x > cfg_local.comp_out_limit) x = cfg_local.comp_out_limit;
                 if (x < -cfg_local.comp_out_limit) x = -cfg_local.comp_out_limit;
+            }
+#endif
+
+#if AUDIO_ENABLE_BANDPASS
+            if (cfg_local.enable_bandpass) {
+                for (int i = 0; i < cfg_local.bp_stages; i++) x = biquad_process(&bp_hpf[i], x);
+                for (int i = 0; i < cfg_local.bp_stages; i++) x = biquad_process(&bp_lpf[i], x);
             }
 #endif
 
