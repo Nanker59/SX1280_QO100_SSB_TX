@@ -42,6 +42,12 @@
 #define DITHER_SUBSTEPS     4
 // ===============================================
 
+// ================== TIMING JITTER (anti-aliasing) ==================
+// Adds random timing jitter to spread 8kHz sampling products into noise
+#define TIMING_JITTER_ENABLE    1
+#define TIMING_JITTER_MAX_US    0    // Max jitter +/- in microseconds (0 = off)
+// ===============================================
+
 // ================== BUFFERING ==================
 #define BLOCK_SAMPLES       256u
 #define NUM_BLOCKS          8u   // increased from 2 to prevent underruns
@@ -54,28 +60,29 @@
 
 // ================== AUDIO SHAPING (default values) ==================
 #define AUDIO_ENABLE_BANDPASS       1
-#define AUDIO_BP_LO_HZ              200.0f
-#define AUDIO_BP_HI_HZ              2700.0f
+#define AUDIO_BP_LO_HZ              50.0f
+#define AUDIO_BP_HI_HZ              2900.0f
 #define AUDIO_BP_MAX_STAGES         10      // Max stages (compile-time allocation)
-#define AUDIO_BP_DEFAULT_STAGES     7       // Default stages (runtime adjustable, 1-10)
+#define AUDIO_BP_DEFAULT_STAGES     10      // Default stages (runtime adjustable, 1-10)
 // Each stage = 12 dB/octave, so 7 stages = 84 dB/oct, 10 stages = 120 dB/oct
 
 #define AUDIO_ENABLE_EQ             1
-#define EQ_LOW_SHELF_HZ             190.0f
-#define EQ_LOW_SHELF_DB             (-9.5f)
-#define EQ_HIGH_SHELF_HZ            1700.0f
-#define EQ_HIGH_SHELF_DB            (13.5f)
+#define EQ_LOW_SHELF_HZ             180.0f
+#define EQ_LOW_SHELF_DB             (0.0f)
+#define EQ_HIGH_SHELF_HZ            2380.0f
+#define EQ_HIGH_SHELF_DB            (24.0f)
+#define EQ_SLOPE                    2.0f   // Shelf slope: 0.5=gentle, 1.0=standard, 2.0=steep
 // ===============================================
 
 // ================== COMPRESSION (default values) ==================
 #define AUDIO_ENABLE_COMPRESSOR     1
-#define COMP_THRESHOLD_DB           (-12.5f)
-#define COMP_RATIO                  (6.1f)
-#define COMP_ATTACK_MS              (41.1f)
+#define COMP_THRESHOLD_DB           (-2.5f)
+#define COMP_RATIO                  (14.0f)
+#define COMP_ATTACK_MS              (161.3f)
 #define COMP_RELEASE_MS             (1595.0f)
-#define COMP_MAKEUP_DB              (0.0f)
-#define COMP_KNEE_DB                (16.5f)
-#define COMP_OUTPUT_LIMIT           (0.312f)
+#define COMP_MAKEUP_DB              (1.0f)
+#define COMP_KNEE_DB                (1.0f)
+#define COMP_OUTPUT_LIMIT           (0.976f)
 // ===============================================
 
 // ================== MODULE VARIANT ==================
@@ -118,7 +125,7 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 #define PWR_MAX_DBM         (13)
 #define PWR_MIN_DBM         (-18)
 
-#define AMP_GAIN            4.36f
+#define AMP_GAIN            2.28f
 #define AMP_MIN_A           0.000002f
 
 #define RAMP_TIME           0xE0     // 20 us
@@ -127,6 +134,8 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 static volatile uint32_t g_center_freq_hz = BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
+static volatile uint8_t g_jitter_us = TIMING_JITTER_MAX_US;  // Runtime jitter setting (0 = off)
+static volatile int8_t g_tx_power_max_dbm = 13;              // Default TX power 13 dBm
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -549,7 +558,7 @@ static void sx_print_diag(void) {
     cdc_printf("TCXO_EN pin: %d\r\n", gpio_get(PIN_TCXO_EN));
 #endif
     cdc_printf("Base freq: %lu Hz\r\n", (unsigned long)BASE_FREQ_HZ);
-    cdc_printf("PWR_MAX: %d dBm\r\n", PWR_MAX_DBM);
+    cdc_printf("TX power max: %d dBm\r\n", g_tx_power_max_dbm);
     
     // Buffer diagnostics
     uint32_t prod = g_prod_block;
@@ -607,8 +616,8 @@ static void sx_test_cw(void) {
     cdc_printf("Freq: %lu Hz\r\n", (unsigned long)g_center_freq_hz);
     
     // Max power
-    sx_set_tx_params_dbm(PWR_MAX_DBM);
-    cdc_printf("Power: %d dBm\r\n", PWR_MAX_DBM);
+    sx_set_tx_params_dbm(g_tx_power_max_dbm);
+    cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
     
     // Enable PA
     gpio_put(PIN_TX_EN, 1);
@@ -695,12 +704,13 @@ static void biquad_init_highpass_bw2(biquad_t *q, float fc, float fs) {
     biquad_reset(q);
 }
 
-static void biquad_init_low_shelf(biquad_t *q, float fc, float fs, float gain_db) {
+static void biquad_init_low_shelf(biquad_t *q, float fc, float fs, float gain_db, float slope) {
     const float A = powf(10.0f, gain_db / 40.0f);
     const float w0 = 2.0f * (float)M_PI * fc / fs;
     const float cw = cosf(w0);
     const float sw = sinf(w0);
-    const float alpha = sw * 0.5f * 1.41421356f;
+    // slope: S=1 gives max steepness (12dB/oct), S=0.5 is gentler
+    const float alpha = sw * 0.5f * sqrtf((A + 1.0f/A) * (1.0f/slope - 1.0f) + 2.0f);
 
     float b0 =    A*((A+1.0f) - (A-1.0f)*cw + 2.0f*sqrtf(A)*alpha);
     float b1 =  2.0f*A*((A-1.0f) - (A+1.0f)*cw);
@@ -714,12 +724,12 @@ static void biquad_init_low_shelf(biquad_t *q, float fc, float fs, float gain_db
     biquad_reset(q);
 }
 
-static void biquad_init_high_shelf(biquad_t *q, float fc, float fs, float gain_db) {
+static void biquad_init_high_shelf(biquad_t *q, float fc, float fs, float gain_db, float slope) {
     const float A = powf(10.0f, gain_db / 40.0f);
     const float w0 = 2.0f * (float)M_PI * fc / fs;
     const float cw = cosf(w0);
     const float sw = sinf(w0);
-    const float alpha = sw * 0.5f * 1.41421356f;
+    const float alpha = sw * 0.5f * sqrtf((A + 1.0f/A) * (1.0f/slope - 1.0f) + 2.0f);
 
     float b0 =    A*((A+1.0f) + (A-1.0f)*cw + 2.0f*sqrtf(A)*alpha);
     float b1 = -2.0f*A*((A-1.0f) + (A+1.0f)*cw);
@@ -795,6 +805,7 @@ typedef struct {
     float eq_low_db;
     float eq_high_hz;
     float eq_high_db;
+    float eq_slope;     // Shelf slope: 0.5=gentle, 1.0=standard, 2.0=steep
 
     float comp_thr_db;
     float comp_ratio;
@@ -821,6 +832,7 @@ static volatile audio_cfg_t g_cfg = {
     .eq_low_db  = EQ_LOW_SHELF_DB,
     .eq_high_hz = EQ_HIGH_SHELF_HZ,
     .eq_high_db = EQ_HIGH_SHELF_DB,
+    .eq_slope   = EQ_SLOPE,
 
     .comp_thr_db     = COMP_THRESHOLD_DB,
     .comp_ratio      = COMP_RATIO,
@@ -861,6 +873,10 @@ static void cfg_sanitize(audio_cfg_t *c, float fs) {
     if (c->eq_high_hz < 50.0f) c->eq_high_hz = 50.0f;
     if (c->eq_high_hz > fs * 0.45f) c->eq_high_hz = fs * 0.45f;
 
+    // Slope: 0.3 (very gentle) to 2.0 (very steep)
+    if (c->eq_slope < 0.3f) c->eq_slope = 0.3f;
+    if (c->eq_slope > 2.0f) c->eq_slope = 2.0f;
+
     if (c->comp_ratio < 1.0f) c->comp_ratio = 1.0f;
     if (c->comp_attack_ms < 0.1f) c->comp_attack_ms = 0.1f;
     if (c->comp_release_ms < 1.0f) c->comp_release_ms = 1.0f;
@@ -900,8 +916,8 @@ static void apply_cfg_if_dirty(float Fs,
     (void)bp_hpf; (void)bp_lpf;
 #endif
 
-    biquad_init_low_shelf (eq_low,  tmp.eq_low_hz,  Fs, tmp.eq_low_db);
-    biquad_init_high_shelf(eq_high, tmp.eq_high_hz, Fs, tmp.eq_high_db);
+    biquad_init_low_shelf (eq_low,  tmp.eq_low_hz,  Fs, tmp.eq_low_db,  tmp.eq_slope);
+    biquad_init_high_shelf(eq_high, tmp.eq_high_hz, Fs, tmp.eq_high_db, tmp.eq_slope);
 
     compressor_reconfig(comp, Fs, &tmp);
 
@@ -974,18 +990,16 @@ static void cfg_print(void) {
 
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%lu Hz  ppm=%.2f\r\n"
+        "  freq=%lu Hz  ppm=%.2f  jitter=%u us  txpwr=%d dBm\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
-        "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
-        "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
+        "  eq_low_hz=%.1f eq_low_db=%.1f eq_high_hz=%.1f eq_high_db=%.1f eq_slope=%.2f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
-        (unsigned long)g_center_freq_hz, g_ppm_correction,
+        (unsigned long)g_center_freq_hz, g_ppm_correction, g_jitter_us, g_tx_power_max_dbm,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
-        c.eq_low_hz, c.eq_low_db,
-        c.eq_high_hz, c.eq_high_db,
+        c.eq_low_hz, c.eq_low_db, c.eq_high_hz, c.eq_high_db, c.eq_slope,
         c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms, c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit,
         c.amp_gain, c.amp_min_a
     );
@@ -1009,6 +1023,7 @@ static void cmd_help(void) {
         "  set eq_low_db <dB>\r\n"
         "  set eq_high_hz <Hz>\r\n"
         "  set eq_high_db <dB>\r\n"
+        "  set eq_slope <0.3-2.0> (shelf steepness: 0.5=gentle, 1.0=std, 2.0=steep)\r\n"
         "  set comp_thr <dB>\r\n"
         "  set comp_ratio <R>\r\n"
         "  set comp_att <ms>\r\n"
@@ -1018,8 +1033,10 @@ static void cmd_help(void) {
         "  set comp_outlim <0..1>\r\n"
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
+        "  jitter <0-30>  - set timing jitter in µs (0=off, reduces 8kHz artifacts)\r\n"
+        "  txpwr <-18..13> - set max TX power on SX1280 chip in dBm\r\n"
         "\r\n"
-        "Notes: freq/ppm changes apply immediately.\r\n"
+        "Notes: freq/ppm/jitter/txpwr changes apply immediately.\r\n"
     );
 }
 
@@ -1078,6 +1095,34 @@ static void cdc_handle_line(char *line) {
         return;
     }
 
+    // Jitter command: jitter <0-30>
+    if (streqi(argv[0], "jitter") && argc >= 2) {
+        float jit;
+        if (!parse_f(argv[1], &jit)) { 
+            cdc_write_str("ERR: bad jitter value\r\n"); 
+            return; 
+        }
+        if (jit < 0.0f) jit = 0.0f;
+        if (jit > 30.0f) jit = 30.0f;
+        g_jitter_us = (uint8_t)jit;
+        cdc_printf("OK jitter=%u us\r\n", g_jitter_us);
+        return;
+    }
+
+    // TX power command: txpwr <-18..13>
+    if (streqi(argv[0], "txpwr") && argc >= 2) {
+        float pwr;
+        if (!parse_f(argv[1], &pwr)) { 
+            cdc_write_str("ERR: bad txpwr value\r\n"); 
+            return; 
+        }
+        if (pwr < (float)PWR_MIN_DBM) pwr = (float)PWR_MIN_DBM;
+        if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
+        g_tx_power_max_dbm = (int8_t)pwr;
+        cdc_printf("OK txpwr=%d dBm\r\n", g_tx_power_max_dbm);
+        return;
+    }
+
     audio_cfg_t c;
     __compiler_memory_barrier();
     memcpy(&c, (const void*)&g_cfg, sizeof(c));
@@ -1108,6 +1153,7 @@ static void cdc_handle_line(char *line) {
         else if (streqi(argv[1], "eq_low_db"))   c.eq_low_db = f;
         else if (streqi(argv[1], "eq_high_hz"))  c.eq_high_hz = f;
         else if (streqi(argv[1], "eq_high_db"))  c.eq_high_db = f;
+        else if (streqi(argv[1], "eq_slope"))    c.eq_slope = f;
         else if (streqi(argv[1], "comp_thr"))    c.comp_thr_db = f;
         else if (streqi(argv[1], "comp_ratio"))  c.comp_ratio = f;
         else if (streqi(argv[1], "comp_att"))    c.comp_attack_ms = f;
@@ -1216,6 +1262,26 @@ static inline float duty_from_A(float A) {
 }
 
 // ==========================================================
+// Fast LFSR for timing jitter (Galois LFSR, 16-bit)
+// ==========================================================
+#if TIMING_JITTER_ENABLE
+static inline uint16_t lfsr_next(uint16_t *state) {
+    uint16_t lsb = *state & 1u;
+    *state >>= 1;
+    if (lsb) *state ^= 0xB400u;  // taps: 16,14,13,11
+    return *state;
+}
+
+// Returns jitter in range [-TIMING_JITTER_MAX_US, +TIMING_JITTER_MAX_US]
+static inline int32_t get_timing_jitter_us(uint16_t *lfsr) {
+    uint16_t r = lfsr_next(lfsr);
+    // Map 0-65535 to -MAX..+MAX
+    int32_t jitter = ((int32_t)(r & 0x7F) - 63) * TIMING_JITTER_MAX_US / 63;
+    return jitter;
+}
+#endif
+
+// ==========================================================
 // CORE1: timed radio apply loop
 // ==========================================================
 static void core1_radio_apply_loop(void) {
@@ -1243,6 +1309,10 @@ static void core1_radio_apply_loop(void) {
     int32_t last_p_dbm = 9999;
     bool last_tx_on = false;  // Start with TX off
     bool tx_en_activated = false;  // Track if we've enabled the PA
+
+#if TIMING_JITTER_ENABLE
+    uint16_t lfsr_state = 0xACE1u;  // Non-zero seed
+#endif
 
     while (true) {
         // If CW test mode is active, skip SPI operations
@@ -1283,10 +1353,23 @@ static void core1_radio_apply_loop(void) {
         uint64_t next_us = time_us_64();
 
         for (uint32_t i = 0; i < BLOCK_SAMPLES; i++) {
+            sample_cmd_t c = blk[i];
+            
+#if TIMING_JITTER_ENABLE
+            // Simple timing jitter - no interpolation, just small random offset
+            uint8_t jit_max = g_jitter_us;
+            if (jit_max > 0) {
+                uint16_t r = lfsr_next(&lfsr_state);
+                int32_t jitter = ((int32_t)(r & 0x1F) - 16) * (int32_t)jit_max / 16;  // ±jit_max
+                next_us += (uint32_t)((int32_t)sample_period_us + jitter);
+            } else {
+                next_us += sample_period_us;
+            }
+#else
             next_us += sample_period_us;
+#endif
 
             for (uint32_t k = 0; k < substeps; k++) {
-                sample_cmd_t c = blk[i];
 
                 if ((bool)c.tx_on != last_tx_on) {
                     if (c.tx_on) sx_start_tx_continuous_wave();
@@ -1469,7 +1552,7 @@ int main(void) {
                 g_ppm_correction = 0.0f;
                 
                 sx_set_rf_frequency_steps(get_base_steps());
-                sx_set_tx_params_dbm((int32_t)PWR_MAX_DBM);
+                sx_set_tx_params_dbm((int32_t)g_tx_power_max_dbm);
                 gpio_put(PIN_TX_EN, 1);
                 sx_start_tx_continuous_wave();
                 
@@ -1717,20 +1800,21 @@ int main(void) {
             } else {
                 tx_on = 1;
 
+                int8_t pwr_max = g_tx_power_max_dbm;  // Local copy for this sample
                 float Aeff = A * cfg_local.amp_gain;
                 if (Aeff < cfg_local.amp_min_a) Aeff = cfg_local.amp_min_a;
 
-                float p_raw = (float)PWR_MAX_DBM + 20.0f * log10f(Aeff);
+                float p_raw = (float)pwr_max + 20.0f * log10f(Aeff);
 
                 float p_des = p_raw;
-                if (p_des > (float)PWR_MAX_DBM) p_des = (float)PWR_MAX_DBM;
+                if (p_des > (float)pwr_max) p_des = (float)pwr_max;
                 if (p_des < (float)PWR_MIN_DBM) p_des = (float)PWR_MIN_DBM;
 
                 int32_t p_low  = (int32_t)floorf(p_des);
                 int32_t p_high = p_low + 1;
 
                 if (p_low  < PWR_MIN_DBM) p_low  = PWR_MIN_DBM;
-                if (p_high > PWR_MAX_DBM) p_high = PWR_MAX_DBM;
+                if (p_high > pwr_max) p_high = pwr_max;
 
                 float frac = p_des - (float)p_low;
                 if (frac < 0.0f) frac = 0.0f;

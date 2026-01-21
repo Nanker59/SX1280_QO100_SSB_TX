@@ -132,17 +132,19 @@ After connecting USB, a serial port is available with the following commands:
 
 | Command | Description |
 |---------|-------------|
-| `set bp_lo <Hz>` | Lower filter frequency (default 300 Hz) |
-| `set bp_hi <Hz>` | Upper filter frequency (default 2700 Hz) |
+| `set bp_lo <Hz>` | Lower filter frequency (default 50 Hz) |
+| `set bp_hi <Hz>` | Upper filter frequency (default 2900 Hz) |
+| `set bp_stages <1-10>` | Filter steepness (12 dB/oct per stage) |
 
 ### Equalizer Settings
 
 | Command | Description |
 |---------|-------------|
-| `set eq_low_hz <Hz>` | Low band frequency |
-| `set eq_low_db <dB>` | Low band gain |
-| `set eq_high_hz <Hz>` | High band frequency |
-| `set eq_high_db <dB>` | High band gain |
+| `set eq_low_hz <Hz>` | Low shelf frequency |
+| `set eq_low_db <dB>` | Low shelf gain |
+| `set eq_high_hz <Hz>` | High shelf frequency |
+| `set eq_high_db <dB>` | High shelf gain |
+| `set eq_slope <0.3-2.0>` | Shelf steepness (0.5=gentle, 1.0=standard, 2.0=steep) |
 
 ### Compressor Settings
 
@@ -163,11 +165,18 @@ After connecting USB, a serial port is available with the following commands:
 | `set amp_gain <float>` | Final gain |
 | `set amp_min_a <float>` | Minimum amplitude |
 
+### Additional Commands
+
+| Command | Description |
+|---------|-------------|
+| `jitter <0-30>` | Timing jitter in µs (reduces 8 kHz artifacts) |
+| `txpwr <-18..13>` | Max TX power on SX1280 chip in dBm |
+
 ## Technical Specifications
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency range | 2400-2500 MHz |
+| Frequency range | 2400.000 - 2400.500 MHz |
 | Output power | up to +27 dBm |
 | Modulation | SSB (USB), CW |
 | Audio sample rate | 48 kHz (USB) → 8 kHz (DSP) |
@@ -176,8 +185,35 @@ After connecting USB, a serial port is available with the following commands:
 ## QO-100 Uplink
 
 QO-100 Narrowband Transponder:
-- **Uplink:** 2400.050 - 2400.300 MHz
-- **Downlink:** 10489.550 - 10489.800 MHz
+- **Uplink:** 2400.000 - 2400.500 MHz
+- **Downlink:** 10489.500 - 10490.000 MHz
+
+## Changelog
+
+### v1.4.0
+- Added adjustable bandpass filter stages (`set bp_stages 1-10`) - 12 dB/oct per stage
+- Added EQ slope parameter (`set eq_slope 0.3-2.0`) for shelf filter steepness
+- Added timing jitter dithering (`jitter 0-30`) to reduce 8 kHz aliasing artifacts
+- Added TX power control (`txpwr -18..13`) for SX1280 chip power adjustment
+- Python GUI (`gui.py`) with all DSP sliders
+- Updated default DSP parameters for better audio quality
+
+### v1.3.0
+- DSP chain reordered: EQ → Compressor → BPF
+- Added Python GUI for CDC control
+
+### v1.2.0
+- Fixed USB Audio compatibility on Windows
+- Added volume control support
+
+### v1.1.0
+- Initial release with basic SSB TX functionality
+
+## TODO
+
+- [ ] Fix equalizer high frequency boost (currently not effective enough)
+- [ ] Add preset system for saving/loading configurations
+- [ ] Add spectrum analyzer display in GUI
 
 ## Warning
 
