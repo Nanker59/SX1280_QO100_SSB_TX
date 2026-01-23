@@ -60,6 +60,8 @@ target_link_libraries(SX1280SDR
         hardware_gpio
         hardware_clocks
         pico_multicore
+        hardware_pio
+        hardware_pwm
         m
 
 )

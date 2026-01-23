@@ -132,8 +132,8 @@ After connecting USB, a serial port is available with the following commands:
 
 | Command | Description |
 |---------|-------------|
-| `set bp_lo <Hz>` | Lower filter frequency (default 50 Hz) |
-| `set bp_hi <Hz>` | Upper filter frequency (default 2900 Hz) |
+| `set bp_lo <Hz>` | Lower filter frequency (default 200 Hz) |
+| `set bp_hi <Hz>` | Upper filter frequency (default 2700 Hz) |
 | `set bp_stages <1-10>` | Filter steepness (12 dB/oct per stage) |
 
 ### Equalizer Settings
@@ -144,7 +144,6 @@ After connecting USB, a serial port is available with the following commands:
 | `set eq_low_db <dB>` | Low shelf gain |
 | `set eq_high_hz <Hz>` | High shelf frequency |
 | `set eq_high_db <dB>` | High shelf gain |
-| `set eq_slope <0.3-2.0>` | Shelf steepness (0.5=gentle, 1.0=standard, 2.0=steep) |
 
 ### Compressor Settings
 
@@ -169,7 +168,6 @@ After connecting USB, a serial port is available with the following commands:
 
 | Command | Description |
 |---------|-------------|
-| `jitter <0-30>` | Timing jitter in µs (reduces 8 kHz artifacts) |
 | `txpwr <-18..13>` | Max TX power on SX1280 chip in dBm |
 
 ## Technical Specifications
@@ -190,13 +188,20 @@ QO-100 Narrowband Transponder:
 
 ## Changelog
 
-### v1.4.0
-- Added adjustable bandpass filter stages (`set bp_stages 1-10`) - 12 dB/oct per stage
-- Added EQ slope parameter (`set eq_slope 0.3-2.0`) for shelf filter steepness
-- Added timing jitter dithering (`jitter 0-30`) to reduce 8 kHz aliasing artifacts
-- Added TX power control (`txpwr -18..13`) for SX1280 chip power adjustment
-- Python GUI (`gui.py`) with all DSP sliders
-- Updated default DSP parameters for better audio quality
+### v1.4.1
+- **CRITICAL FIX:** Fixed NaN bug in shelf filter that caused continuous carrier instead of SSB modulation
+- **CRITICAL FIX:** Reverted unstable DSP parameter changes from v1.4.0 that caused distorted audio
+- Removed experimental features (timing jitter, EQ slope) that caused instability
+- Restored proven default DSP values from v1.3.0
+- Kept only stable new features: TX power control (`txpwr`) and BP stages (`bp_stages`)
+- GUI updated to match firmware capabilities
+
+### v1.4.0 (DEPRECATED - DO NOT USE)
+- ⚠️ This version has critical bugs causing continuous carrier and distorted audio
+- Added adjustable bandpass filter stages (`set bp_stages 1-10`)
+- Added EQ slope parameter (removed in v1.4.1)
+- Added timing jitter dithering (removed in v1.4.1)
+- Added TX power control (`txpwr -18..13`)
 
 ### v1.3.0
 - DSP chain reordered: EQ → Compressor → BPF
@@ -211,7 +216,6 @@ QO-100 Narrowband Transponder:
 
 ## TODO
 
-- [ ] Fix equalizer high frequency boost (currently not effective enough)
 - [ ] Add preset system for saving/loading configurations
 - [ ] Add spectrum analyzer display in GUI
 

@@ -38,7 +38,6 @@ class TxConfig:
     # RF
     freq_hz: int = 2_400_400_000
     ppm: float = 0.0
-    jitter_us: int = 0  # Timing jitter 0-30 µs (reduces 8kHz artifacts)
     tx_power_dbm: int = 13  # Max TX power on SX1280 chip (-18 to +13 dBm)
     
     # Enables
@@ -47,28 +46,27 @@ class TxConfig:
     enable_comp: bool = True
     
     # Bandpass
-    bp_lo_hz: float = 50.0
-    bp_hi_hz: float = 2900.0
-    bp_stages: int = 10  # 1-10, each stage = 12 dB/oct
+    bp_lo_hz: float = 200.0
+    bp_hi_hz: float = 2700.0
+    bp_stages: int = 7  # 1-10, each stage = 12 dB/oct
     
     # EQ
-    eq_low_hz: float = 180.0
-    eq_low_db: float = 0.0
-    eq_high_hz: float = 2380.0
-    eq_high_db: float = 24.0
-    eq_slope: float = 2.0  # Shelf slope: 0.3=very gentle, 1.0=standard, 2.0=steep
+    eq_low_hz: float = 190.0
+    eq_low_db: float = -9.5
+    eq_high_hz: float = 1700.0
+    eq_high_db: float = 13.5
     
     # Compressor
-    comp_thr_db: float = -2.5
-    comp_ratio: float = 14.0
-    comp_attack_ms: float = 161.3
+    comp_thr_db: float = -12.5
+    comp_ratio: float = 6.1
+    comp_attack_ms: float = 41.1
     comp_release_ms: float = 1595.0
-    comp_makeup_db: float = 1.0
-    comp_knee_db: float = 1.0
-    comp_out_limit: float = 0.976
+    comp_makeup_db: float = 0.0
+    comp_knee_db: float = 16.5
+    comp_out_limit: float = 0.312
     
     # Power shaping
-    amp_gain: float = 2.28
+    amp_gain: float = 4.36
     amp_min_a: float = 0.000002
 
 # ============================================================
@@ -282,7 +280,6 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
         self.freq_hz_var = tk.StringVar(value=str(self.config.freq_hz))
         self.ppm_var = tk.StringVar(value="0.0")
-        self.jitter_var = tk.IntVar(value=self.config.jitter_us)
         self.txpwr_var = tk.IntVar(value=self.config.tx_power_dbm)
         
         # Enables
@@ -300,7 +297,6 @@ class SX1280ControlApp(ttk.Frame):
         self.eq_low_db_var = tk.DoubleVar(value=self.config.eq_low_db)
         self.eq_high_hz_var = tk.DoubleVar(value=self.config.eq_high_hz)
         self.eq_high_db_var = tk.DoubleVar(value=self.config.eq_high_db)
-        self.eq_slope_var = tk.DoubleVar(value=self.config.eq_slope)
         
         # Compressor
         self.comp_thr_var = tk.DoubleVar(value=self.config.comp_thr_db)
@@ -419,20 +415,10 @@ class SX1280ControlApp(ttk.Frame):
         ttk.Button(ppm_frame, text="Set", command=self._send_ppm).pack(side="left", padx=5)
         ttk.Label(ppm_frame, text="(-100 to +100)").pack(side="left")
         
-        # Timing Jitter
-        ttk.Label(rf_frame, text="Timing jitter:").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        jitter_frame = ttk.Frame(rf_frame)
-        jitter_frame.grid(row=3, column=1, sticky="ew", padx=5, pady=(10, 0))
-        jitter_frame.columnconfigure(0, weight=1)
-        
-        LabeledScale(jitter_frame, "", self.jitter_var, 0, 30, 1,
-                     lambda v: self._send_cmd_safe(f"jitter {int(v)}"),
-                     lambda v: f"{int(v)} µs (0=off)").pack(fill="x")
-        
         # TX Power
-        ttk.Label(rf_frame, text="TX Power:").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(rf_frame, text="TX Power:").grid(row=3, column=0, sticky="w", pady=(10, 0))
         txpwr_frame = ttk.Frame(rf_frame)
-        txpwr_frame.grid(row=4, column=1, sticky="ew", padx=5, pady=(10, 0))
+        txpwr_frame.grid(row=3, column=1, sticky="ew", padx=5, pady=(10, 0))
         txpwr_frame.columnconfigure(0, weight=1)
         
         LabeledScale(txpwr_frame, "", self.txpwr_var, -18, 13, 1,
@@ -482,9 +468,6 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(eq_frame, "High shelf gain (dB)", self.eq_high_db_var, -24, 24, 0.5,
                      lambda v: self.debounced_send.call(f"set eq_high_db {v:.1f}"),
                      "{:.1f}").pack(fill="x")
-        LabeledScale(eq_frame, "Shelf slope", self.eq_slope_var, 0.3, 2.0, 0.1,
-                     lambda v: self.debounced_send.call(f"set eq_slope {v:.2f}"),
-                     lambda v: f"{v:.1f} ({'gentle' if v < 0.7 else 'steep' if v > 1.3 else 'std'})").pack(fill="x")
         
         # === Compressor ===
         comp_frame = ttk.LabelFrame(tab, text="Compressor", padding=10)
@@ -736,9 +719,6 @@ class SX1280ControlApp(ttk.Frame):
         except:
             pass
         
-        # Jitter
-        self._send_cmd_safe(f"jitter {int(self.jitter_var.get())}")
-        
         # TX Power
         self._send_cmd_safe(f"txpwr {int(self.txpwr_var.get())}")
         
@@ -757,7 +737,6 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"set eq_low_db {self.eq_low_db_var.get():.1f}")
         self._send_cmd_safe(f"set eq_high_hz {self.eq_high_hz_var.get():.0f}")
         self._send_cmd_safe(f"set eq_high_db {self.eq_high_db_var.get():.1f}")
-        self._send_cmd_safe(f"set eq_slope {self.eq_slope_var.get():.2f}")
         
         # Compressor
         self._send_cmd_safe(f"set comp_thr {self.comp_thr_var.get():.1f}")
