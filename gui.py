@@ -36,9 +36,10 @@ except ImportError:
 class TxConfig:
     """Mirrors the firmware's audio_cfg_t structure"""
     # RF
-    freq_hz: int = 2_400_400_000
+    freq_hz: float = 2_400_400_000.0  # Now supports sub-Hz precision
     ppm: float = 0.0
     tx_power_dbm: int = 13  # Max TX power on SX1280 chip (-18 to +13 dBm)
+    tx_enabled: bool = True
     
     # Enables
     enable_bp: bool = True
@@ -46,27 +47,27 @@ class TxConfig:
     enable_comp: bool = True
     
     # Bandpass
-    bp_lo_hz: float = 200.0
+    bp_lo_hz: float = 50.0
     bp_hi_hz: float = 2700.0
-    bp_stages: int = 7  # 1-10, each stage = 12 dB/oct
+    bp_stages: int = 7  # 1-10, each stage = 12 dB/oct (7 = 84 dB/oct)
     
-    # EQ
+    # EQ (Shelving)
     eq_low_hz: float = 190.0
-    eq_low_db: float = -9.5
+    eq_low_db: float = -2.0
     eq_high_hz: float = 1700.0
     eq_high_db: float = 13.5
     
     # Compressor
-    comp_thr_db: float = -12.5
+    comp_thr_db: float = -2.5
     comp_ratio: float = 6.1
     comp_attack_ms: float = 41.1
     comp_release_ms: float = 1595.0
     comp_makeup_db: float = 0.0
     comp_knee_db: float = 16.5
-    comp_out_limit: float = 0.312
+    comp_out_limit: float = 0.940
     
     # Power shaping
-    amp_gain: float = 4.36
+    amp_gain: float = 2.9
     amp_min_a: float = 0.000002
 
 # ============================================================
@@ -258,13 +259,22 @@ class SX1280ControlApp(ttk.Frame):
         self.rx_queue: queue.Queue = queue.Queue()
         self.worker = SerialWorker(self.rx_queue)
         
-        # Debouncers
+        # Debouncers (kept for other sliders, but freq/ppm are now immediate)
         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
         self.freq_debouncer = Debouncer(master, 200, self._send_freq)
         
         # Build UI
         self._create_variables()
         self._build_ui()
+        
+        # Initialize displays
+        self._update_freq_display()
+        
+        # Global scroll binding for frequency tuning (works anywhere in window)
+        master.bind_all("<Button-4>", self._on_global_scroll)  # Linux scroll up
+        master.bind_all("<Button-5>", self._on_global_scroll)  # Linux scroll down
+        master.bind_all("<MouseWheel>", self._on_global_scroll)  # Windows/macOS
+        
         self._poll_rx()
         
         # Pack main frame
@@ -279,8 +289,10 @@ class SX1280ControlApp(ttk.Frame):
         # RF
         self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
         self.freq_hz_var = tk.StringVar(value=str(self.config.freq_hz))
-        self.ppm_var = tk.StringVar(value="0.0")
+        self.ppm_var = tk.DoubleVar(value=0.0)
         self.txpwr_var = tk.IntVar(value=self.config.tx_power_dbm)
+        self.tx_enabled_var = tk.BooleanVar(value=True)
+        self.scroll_tune_enabled_var = tk.BooleanVar(value=False)  # Scroll tuning on/off
         
         # Enables
         self.en_bp_var = tk.BooleanVar(value=self.config.enable_bp)
@@ -378,11 +390,31 @@ class SX1280ControlApp(ttk.Frame):
         rf_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         rf_frame.columnconfigure(1, weight=1)
         
+        # Bind scroll to entire RF frame
+        rf_frame.bind("<MouseWheel>", self._on_freq_scroll)
+        rf_frame.bind("<Button-4>", self._on_freq_scroll)
+        rf_frame.bind("<Button-5>", self._on_freq_scroll)
+        
+        # === TX ON/OFF Button (prominent, with color) ===
+        tx_btn_frame = ttk.Frame(rf_frame)
+        tx_btn_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        
+        # Use regular tk.Button for color support
+        self.tx_button = tk.Button(tx_btn_frame, text="TX OFF", width=12, font=("TkDefaultFont", 11, "bold"),
+                                    command=self._toggle_tx, relief="raised", bd=3)
+        self.tx_button.pack(side="left", padx=5)
+        self._update_tx_button()
+        
+        # Scroll tuning toggle
+        self.scroll_tune_cb = ttk.Checkbutton(tx_btn_frame, text="🖱️ Scroll Tune (50 Hz/step)", 
+                                               variable=self.scroll_tune_enabled_var)
+        self.scroll_tune_cb.pack(side="left", padx=20)
+        
         # Frequency slider
-        ttk.Label(rf_frame, text="Frequency:").grid(row=0, column=0, sticky="w")
+        ttk.Label(rf_frame, text="Frequency:").grid(row=1, column=0, sticky="w")
         
         freq_slider_frame = ttk.Frame(rf_frame)
-        freq_slider_frame.grid(row=0, column=1, sticky="ew", padx=5)
+        freq_slider_frame.grid(row=1, column=1, sticky="ew", padx=5)
         freq_slider_frame.columnconfigure(0, weight=1)
         
         self.freq_scale = ttk.Scale(freq_slider_frame, 
@@ -395,30 +427,51 @@ class SX1280ControlApp(ttk.Frame):
         
         # Frequency entry
         freq_entry_frame = ttk.Frame(rf_frame)
-        freq_entry_frame.grid(row=0, column=2)
+        freq_entry_frame.grid(row=1, column=2)
         
         self.freq_entry = ttk.Entry(freq_entry_frame, textvariable=self.freq_hz_var, width=14)
         self.freq_entry.pack(side="left")
         self.freq_entry.bind("<Return>", lambda e: self._send_freq_from_entry())
+        self.freq_entry.bind("<MouseWheel>", self._on_freq_scroll)
+        self.freq_entry.bind("<Button-4>", self._on_freq_scroll)
+        self.freq_entry.bind("<Button-5>", self._on_freq_scroll)
         ttk.Label(freq_entry_frame, text=" Hz").pack(side="left")
         
-        # MHz display
-        self.freq_mhz_label = ttk.Label(rf_frame, text="2400.1000 MHz", font=("TkDefaultFont", 12, "bold"))
-        self.freq_mhz_label.grid(row=1, column=1, sticky="w", padx=5)
+        # Frequency display frame (uplink + downlink)
+        freq_display_frame = ttk.Frame(rf_frame)
+        freq_display_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
         
-        # PPM
-        ttk.Label(rf_frame, text="PPM correction:").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        # Uplink MHz display
+        self.freq_mhz_label = ttk.Label(freq_display_frame, text="2400.1000 MHz ↑", 
+                                         font=("TkDefaultFont", 12, "bold"))
+        self.freq_mhz_label.pack(side="left")
+        self.freq_mhz_label.bind("<MouseWheel>", self._on_freq_scroll)
+        self.freq_mhz_label.bind("<Button-4>", self._on_freq_scroll)
+        self.freq_mhz_label.bind("<Button-5>", self._on_freq_scroll)
+        
+        # Downlink display (QO-100: uplink 2400.xxx -> downlink 10489.xxx)
+        ttk.Label(freq_display_frame, text="   →   ").pack(side="left")
+        self.downlink_label = ttk.Label(freq_display_frame, text="10489.6000 MHz ↓", 
+                                         font=("TkDefaultFont", 12, "bold"), foreground="blue")
+        self.downlink_label.pack(side="left")
+        
+        # PPM slider (fine adjustment -2 to +2 ppm) - IMMEDIATE response
+        ttk.Label(rf_frame, text="PPM:").grid(row=3, column=0, sticky="w", pady=(10, 0))
         ppm_frame = ttk.Frame(rf_frame)
-        ppm_frame.grid(row=2, column=1, sticky="w", padx=5, pady=(10, 0))
+        ppm_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=(10, 0))
+        ppm_frame.columnconfigure(0, weight=1)
         
-        ttk.Entry(ppm_frame, textvariable=self.ppm_var, width=10).pack(side="left")
-        ttk.Button(ppm_frame, text="Set", command=self._send_ppm).pack(side="left", padx=5)
-        ttk.Label(ppm_frame, text="(-100 to +100)").pack(side="left")
+        self.ppm_scale = ttk.Scale(ppm_frame, from_=-2.0, to=2.0, orient=tk.HORIZONTAL,
+                                    variable=self.ppm_var, command=self._on_ppm_slider)
+        self.ppm_scale.grid(row=0, column=0, sticky="ew")
         
-        # TX Power
-        ttk.Label(rf_frame, text="TX Power:").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        self.ppm_label = ttk.Label(ppm_frame, text="0.000 ppm", width=12)
+        self.ppm_label.grid(row=0, column=1, padx=5)
+        
+        # TX Power - IMMEDIATE response
+        ttk.Label(rf_frame, text="TX Power:").grid(row=4, column=0, sticky="w", pady=(10, 0))
         txpwr_frame = ttk.Frame(rf_frame)
-        txpwr_frame.grid(row=3, column=1, sticky="ew", padx=5, pady=(10, 0))
+        txpwr_frame.grid(row=4, column=1, sticky="ew", padx=5, pady=(10, 0))
         txpwr_frame.columnconfigure(0, weight=1)
         
         LabeledScale(txpwr_frame, "", self.txpwr_var, -18, 13, 1,
@@ -658,41 +711,132 @@ class SX1280ControlApp(ttk.Frame):
         v = "1" if enabled else "0"
         self._send_cmd_safe(f"enable {which} {v}")
 
+    def _toggle_tx(self):
+        """Toggle TX on/off"""
+        current = self.tx_enabled_var.get()
+        new_state = not current
+        self.tx_enabled_var.set(new_state)
+        self._update_tx_button()
+        self._send_cmd_safe(f"tx {'1' if new_state else '0'}")
+
+    def _update_tx_button(self):
+        """Update TX button appearance based on state"""
+        if self.tx_enabled_var.get():
+            self.tx_button.config(text="TX ON", bg="#00cc00", fg="white", 
+                                   activebackground="#00ff00", activeforeground="white")
+        else:
+            self.tx_button.config(text="TX OFF", bg="#cccccc", fg="black",
+                                   activebackground="#dddddd", activeforeground="black")
+
+    def _on_ppm_slider(self, _val):
+        """Handle PPM slider change - IMMEDIATE response"""
+        ppm = self.ppm_var.get()
+        self.ppm_label.config(text=f"{ppm:.3f} ppm")
+        self._update_freq_display()
+        # Send immediately without debounce
+        self._send_cmd_safe(f"ppm {ppm:.4f}")
+
+    def _update_freq_display(self):
+        """Update frequency displays (uplink + downlink)"""
+        try:
+            hz = float(self.freq_hz_var.get())
+        except ValueError:
+            hz = self.config.freq_hz
+        
+        # Uplink display
+        self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz ↑")
+        
+        # QO-100 downlink: uplink 2400.xxx MHz -> downlink 10489.xxx MHz
+        # Offset = 10489.5 - 2400.0 = 8089.5 MHz
+        downlink_hz = hz + 8089_500_000
+        self.downlink_label.config(text=f"{downlink_hz/1_000_000:.4f} MHz ↓")
+
+    def _on_global_scroll(self, event):
+        """Global scroll handler - tune frequency if scroll tune is enabled"""
+        if not self.scroll_tune_enabled_var.get():
+            return  # Let event propagate normally
+        
+        # Check if we're on the first tab (RF & DSP)
+        try:
+            current_tab = self.notebook.index(self.notebook.select())
+            if current_tab != 0:
+                return  # Only tune on RF tab
+        except:
+            return
+        
+        # Call the frequency scroll handler
+        return self._on_freq_scroll(event)
+
+    def _on_freq_scroll(self, event):
+        """Handle mouse scroll for frequency tuning (50 Hz per step)"""
+        if not self.scroll_tune_enabled_var.get():
+            return  # Scroll tuning disabled
+        
+        # Determine scroll direction
+        if event.num == 4:
+            delta = 50  # Linux scroll up
+        elif event.num == 5:
+            delta = -50  # Linux scroll down
+        elif hasattr(event, 'delta'):
+            # Windows/macOS: delta is typically ±120
+            delta = 50 if event.delta > 0 else -50
+        else:
+            return
+        
+        # Get current freq and adjust
+        try:
+            current_hz = float(self.freq_hz_var.get())
+        except ValueError:
+            current_hz = self.config.freq_hz
+        
+        new_hz = current_hz + delta
+        new_hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, new_hz))
+        
+        # Update all displays
+        self.freq_hz_var.set(f"{new_hz:.0f}")
+        self.freq_mhz_var.set(new_hz / 1_000_000)
+        self._update_freq_display()
+        
+        # Send immediately
+        self._send_cmd_safe(f"freq {new_hz:.1f}")
+        
+        # Prevent event propagation
+        return "break"
+
     def _on_freq_slider(self, _val):
+        """Handle frequency slider - IMMEDIATE response"""
         mhz = self.freq_mhz_var.get()
         hz = int(round(mhz * 1_000_000))
         hz = self._clamp_freq(hz)
         self.freq_hz_var.set(str(hz))
-        self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz")
-        self.freq_debouncer.call(hz)
+        self._update_freq_display()
+        # Send immediately
+        self._send_cmd_safe(f"freq {hz}")
 
-    def _clamp_freq(self, hz: int) -> int:
+    def _clamp_freq(self, hz) -> float:
+        """Clamp frequency to valid range (now supports float)"""
         hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
-        hz = self.FREQ_MIN_HZ + ((hz - self.FREQ_MIN_HZ) // self.FREQ_STEP_HZ) * self.FREQ_STEP_HZ
         return hz
 
-    def _send_freq(self, hz: int):
-        self._send_cmd_safe(f"freq {hz}")
+    def _send_freq(self, hz):
+        """Send frequency command (supports sub-Hz precision)"""
+        self._send_cmd_safe(f"freq {hz:.1f}")
 
     def _send_freq_from_entry(self):
         try:
-            hz = int(self.freq_hz_var.get())
+            hz = float(self.freq_hz_var.get().replace(",", "."))
             hz = self._clamp_freq(hz)
-            self.freq_hz_var.set(str(hz))
+            self.freq_hz_var.set(f"{hz:.0f}")
             self.freq_mhz_var.set(hz / 1_000_000)
-            self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz")
-            self._send_cmd_safe(f"freq {hz}")
+            self._update_freq_display()
+            self._send_cmd_safe(f"freq {hz:.1f}")
         except ValueError:
-            messagebox.showerror("Invalid frequency", "Frequency must be an integer in Hz")
+            messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
 
     def _send_ppm(self):
-        try:
-            ppm = float(self.ppm_var.get().replace(",", "."))
-            if not -100 <= ppm <= 100:
-                raise ValueError("PPM out of range")
-            self._send_cmd_safe(f"ppm {ppm}")
-        except ValueError as e:
-            messagebox.showerror("Invalid PPM", f"PPM must be a number between -100 and +100\n{e}")
+        """Send PPM from slider (now handled by _on_ppm_slider)"""
+        ppm = self.ppm_var.get()
+        self._send_cmd_safe(f"ppm {ppm:.4f}")
 
     def _start_cw(self):
         self._send_cmd_safe("cw")

@@ -54,7 +54,7 @@
 
 // ================== AUDIO SHAPING (default values) ==================
 #define AUDIO_ENABLE_BANDPASS       1
-#define AUDIO_BP_LO_HZ              200.0f
+#define AUDIO_BP_LO_HZ              50.0f
 #define AUDIO_BP_HI_HZ              2700.0f
 #define AUDIO_BP_MAX_STAGES         10      // Max stages (compile-time allocation)
 #define AUDIO_BP_DEFAULT_STAGES     7       // Default stages (runtime adjustable, 1-10)
@@ -62,20 +62,20 @@
 
 #define AUDIO_ENABLE_EQ             1
 #define EQ_LOW_SHELF_HZ             190.0f
-#define EQ_LOW_SHELF_DB             (-9.5f)
+#define EQ_LOW_SHELF_DB             (-2.0f)
 #define EQ_HIGH_SHELF_HZ            1700.0f
 #define EQ_HIGH_SHELF_DB            (13.5f)
 // ===============================================
 
 // ================== COMPRESSION (default values) ==================
 #define AUDIO_ENABLE_COMPRESSOR     1
-#define COMP_THRESHOLD_DB           (-12.5f)
+#define COMP_THRESHOLD_DB           (-2.5f)
 #define COMP_RATIO                  (6.1f)
 #define COMP_ATTACK_MS              (41.1f)
 #define COMP_RELEASE_MS             (1595.0f)
 #define COMP_MAKEUP_DB              (0.0f)
 #define COMP_KNEE_DB                (16.5f)
-#define COMP_OUTPUT_LIMIT           (0.312f)
+#define COMP_OUTPUT_LIMIT           (0.940f)
 // ===============================================
 
 // ================== MODULE VARIANT ==================
@@ -118,16 +118,18 @@ static const uint32_t SX_SPI_BAUD = 18000000;
 #define PWR_MAX_DBM         (13)
 #define PWR_MIN_DBM         (-18)
 
-#define AMP_GAIN            4.36f
+#define AMP_GAIN            2.9f
 #define AMP_MIN_A           0.000002f
 
 #define RAMP_TIME           0xE0     // 20 us
 
 // --- Runtime RF config (adjustable via CDC) ---
-static volatile uint32_t g_center_freq_hz = BASE_FREQ_HZ;
+// Frequency stored as double for sub-Hz precision; automatically split into PLL steps + fine DSP offset
+static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
+static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -503,15 +505,23 @@ static inline uint32_t hz_to_steps(uint32_t freq_hz) {
     return (uint32_t)((double)freq_hz / (double)PLL_STEP_HZ);
 }
 
-// Convert Hz to steps with PPM correction applied
-static inline uint32_t hz_to_steps_with_ppm(uint32_t freq_hz, float ppm) {
-    double corrected_hz = (double)freq_hz * (1.0 + ppm / 1000000.0);
+// Calculate corrected frequency with PPM
+static inline double get_corrected_freq_hz(void) {
+    return g_target_freq_hz * (1.0 + (double)g_ppm_correction / 1000000.0);
+}
+
+// Get base PLL steps (integer part)
+static inline uint32_t get_base_steps(void) {
+    double corrected_hz = get_corrected_freq_hz();
     return (uint32_t)(corrected_hz / (double)PLL_STEP_HZ);
 }
 
-// Get current base steps with PPM correction
-static inline uint32_t get_base_steps(void) {
-    return hz_to_steps_with_ppm(g_center_freq_hz, g_ppm_correction);
+// Get fine tune offset in Hz (fractional part that PLL can't reach)
+static inline float get_fine_tune_hz(void) {
+    double corrected_hz = get_corrected_freq_hz();
+    uint32_t base_steps = (uint32_t)(corrected_hz / (double)PLL_STEP_HZ);
+    double base_hz = (double)base_steps * (double)PLL_STEP_HZ;
+    return (float)(corrected_hz - base_hz);
 }
 
 // Get SX1280 status byte
@@ -603,9 +613,9 @@ static void sx_test_cw(void) {
     cdc_printf("Packet: GFSK\r\n");
     
     // Frequency - use current center freq
-    uint32_t steps = hz_to_steps_with_ppm(g_center_freq_hz, g_ppm_correction);
+    uint32_t steps = get_base_steps();
     sx_set_rf_frequency_steps(steps);
-    cdc_printf("Freq: %lu Hz\r\n", (unsigned long)g_center_freq_hz);
+    cdc_printf("Freq: %.1f Hz (steps=%lu)\r\n", g_target_freq_hz, (unsigned long)steps);
     
     // Max power
     sx_set_tx_params_dbm(g_tx_power_max_dbm);
@@ -973,16 +983,21 @@ static void cfg_print(void) {
     memcpy(&c, (const void*)&g_cfg, sizeof(c));
     __compiler_memory_barrier();
 
+    double corrected = get_corrected_freq_hz();
+    float fine = get_fine_tune_hz();
+
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%lu Hz  ppm=%.2f  txpwr=%d dBm\r\n"
+        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
+        "  corrected=%.1f Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n"
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
         "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
-        (unsigned long)g_center_freq_hz, g_ppm_correction, g_tx_power_max_dbm,
+        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
+        corrected, (unsigned long)get_base_steps(), fine,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
         c.eq_low_hz, c.eq_low_db,
@@ -998,10 +1013,11 @@ static void cmd_help(void) {
         "  help\r\n"
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
+        "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  cw            - start CW test transmission\r\n"
         "  stop          - stop CW transmission\r\n"
-        "  freq <Hz>     - set center frequency (e.g. freq 2400100000)\r\n"
-        "  ppm <value>   - set PPM correction (e.g. ppm -1.5)\r\n"
+        "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
+        "  ppm <value>   - set PPM correction (e.g. ppm -0.5)\r\n"
         "  txpwr <-18..13> - set max TX power in dBm\r\n"
         "  enable <bp|eq|comp> <0|1|on|off>\r\n"
         "  set bp_lo <Hz>\r\n"
@@ -1021,7 +1037,7 @@ static void cmd_help(void) {
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
         "\r\n"
-        "Notes: freq/ppm/txpwr changes apply immediately.\r\n"
+        "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
     );
 }
 
@@ -1047,18 +1063,32 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
     if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
 
-    // Frequency command: freq <Hz>
+    // TX enable/disable: tx 0|1
+    if (streqi(argv[0], "tx") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) { 
+            cdc_write_str("ERR: tx 0|1|on|off\r\n"); 
+            return; 
+        }
+        g_tx_enabled = v;
+        cdc_printf("OK tx=%s\r\n", g_tx_enabled ? "ON" : "OFF");
+        return;
+    }
+
+    // Frequency command: freq <Hz> (supports decimal for sub-Hz precision)
     if (streqi(argv[0], "freq") && argc >= 2) {
         char *e = NULL;
-        unsigned long f = strtoul(argv[1], &e, 10);
-        if (e == argv[1] || f < 2400000000UL || f > 2500000000UL) {
+        double f = strtod(argv[1], &e);
+        if (e == argv[1] || f < 2400000000.0 || f > 2500000000.0) {
             cdc_write_str("ERR: freq must be 2400000000-2500000000 Hz\r\n");
             return;
         }
-        g_center_freq_hz = (uint32_t)f;
-        cdc_printf("OK freq=%lu Hz (steps=%lu)\r\n", 
-                   (unsigned long)g_center_freq_hz, 
-                   (unsigned long)get_base_steps());
+        g_target_freq_hz = f;
+        double corrected = get_corrected_freq_hz();
+        float fine = get_fine_tune_hz();
+        cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n", 
+                   g_target_freq_hz, corrected,
+                   (unsigned long)get_base_steps(), fine);
         return;
     }
 
@@ -1074,9 +1104,11 @@ static void cdc_handle_line(char *line) {
             return;
         }
         g_ppm_correction = ppm;
-        cdc_printf("OK ppm=%.2f (steps=%lu)\r\n", 
-                   g_ppm_correction, 
-                   (unsigned long)get_base_steps());
+        double corrected = get_corrected_freq_hz();
+        float fine = get_fine_tune_hz();
+        cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
+                   g_ppm_correction, corrected,
+                   (unsigned long)get_base_steps(), fine);
         return;
     }
 
@@ -1487,7 +1519,7 @@ int main(void) {
                 printf("[BOOT] USB timeout - starting beacon CW on %.3f MHz\n", 
                        (float)BEACON_FREQ_HZ / 1000000.0f);
                 
-                g_center_freq_hz = BEACON_FREQ_HZ;
+                g_target_freq_hz = (double)BEACON_FREQ_HZ;
                 g_ppm_correction = 0.0f;
                 
                 sx_set_rf_frequency_steps(get_base_steps());
@@ -1517,6 +1549,7 @@ int main(void) {
 
     float theta_prev = 0.0f;
     float f_acc = 0.0f;
+    float fine_tune_phase = 0.0f;  // Phase accumulator for fine frequency tuning
 
     float p_acc = 0.0f;
     float tx_acc = 0.0f;
@@ -1652,6 +1685,7 @@ int main(void) {
                 hilbert_reset();
                 theta_prev = 0.0f;
                 f_acc = 0.0f;
+                fine_tune_phase = 0.0f;
                 p_acc = 0.0f;
                 tx_acc = 0.0f;
 
@@ -1703,6 +1737,22 @@ int main(void) {
 
             float I2 = Iq * cphi - Qq * sphi;
             float Q2 = Iq * sphi + Qq * cphi;
+
+            // Apply fine frequency tuning via complex carrier multiplication
+            // Fine tune is calculated automatically from fractional Hz that PLL can't reach
+            float fine_hz = get_fine_tune_hz();  // Auto-calculated from target freq + PPM
+            if (fine_hz != 0.0f) {
+                float fine_cos = cosf(fine_tune_phase);
+                float fine_sin = sinf(fine_tune_phase);
+                float I3 = I2 * fine_cos - Q2 * fine_sin;
+                float Q3 = I2 * fine_sin + Q2 * fine_cos;
+                I2 = I3;
+                Q2 = Q3;
+                fine_tune_phase += 2.0f * (float)M_PI * fine_hz / Fs;
+                // Keep phase in [-π, π] to avoid precision loss
+                if (fine_tune_phase > (float)M_PI)   fine_tune_phase -= 2.0f * (float)M_PI;
+                if (fine_tune_phase < -(float)M_PI) fine_tune_phase += 2.0f * (float)M_PI;
+            }
 
             float A = sqrtf(I2 * I2 + Q2 * Q2);
             float theta = atan2f(Q2, I2);
@@ -1762,6 +1812,11 @@ int main(void) {
                 p_acc += frac;
                 p_chosen = p_low;
                 if (p_acc >= 1.0f && p_high != p_low) { p_chosen = p_high; p_acc -= 1.0f; }
+            }
+
+            // Check global TX enable flag (from GUI TX button)
+            if (!g_tx_enabled) {
+                tx_on = 0;
             }
 
             blk[n].freq_steps = cur_steps;

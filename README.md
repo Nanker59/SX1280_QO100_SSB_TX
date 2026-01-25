@@ -110,6 +110,7 @@ After connecting USB, a serial port is available with the following commands:
 | `help` | List commands |
 | `get` | Show current configuration |
 | `diag` | SX1280 and buffer diagnostics |
+| `tx 0/1` | Enable/disable TX (SSB modulation) |
 | `cw` | Start CW test |
 | `stop` | Stop CW transmission |
 
@@ -117,8 +118,10 @@ After connecting USB, a serial port is available with the following commands:
 
 | Command | Description |
 |---------|-------------|
-| `freq <Hz>` | Set center frequency (e.g. `freq 2400100000`) |
-| `ppm <value>` | Oscillator PPM correction (e.g. `ppm -1.5`) |
+| `freq <Hz>` | Set frequency with sub-Hz precision (e.g. `freq 2400100050.5`) |
+| `ppm <value>` | Oscillator PPM correction (e.g. `ppm -0.5`) |
+
+**Note:** Frequency is automatically split into PLL steps (~198 Hz resolution) plus fine DSP offset for sub-Hz precision.
 
 ### DSP Block Enable/Disable
 
@@ -187,6 +190,24 @@ QO-100 Narrowband Transponder:
 - **Downlink:** 10489.500 - 10490.000 MHz
 
 ## Changelog
+
+### v1.5.0
+- **New feature:** Sub-Hz frequency precision via automatic PLL + DSP fine tuning
+  - Frequency stored as double - no more 198 Hz PLL quantization visible to user
+  - Firmware automatically splits frequency into PLL steps + DSP complex carrier rotation
+- **GUI improvements:**
+  - **TX ON/OFF button** with green color when transmitting
+  - **PPM slider** (-2 to +2 ppm) with immediate response
+  - **Scroll wheel tuning** (50 Hz per step, toggleable checkbox)
+  - **QO-100 downlink frequency** display (uplink → downlink conversion)
+  - All sliders now respond immediately (no delay)
+- Added `tx 0/1` command for TX enable/disable
+- **Updated default DSP values** (optimized for voice):
+  - Bandpass: 50-2700 Hz
+  - EQ low shelf: -2.0 dB (was -9.5)
+  - Compressor threshold: -2.5 dB (was -12.5)
+  - Output limit: 0.940 (was 0.312)
+  - Amp gain: 2.9 (was 4.36)
 
 ### v1.4.1
 - **CRITICAL FIX:** Fixed NaN bug in shelf filter that caused continuous carrier instead of SSB modulation
