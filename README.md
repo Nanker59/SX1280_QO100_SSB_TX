@@ -4,6 +4,13 @@
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
+## Demo
+
+📺 **Video test:** [YouTube Short - SSB TX Test](https://www.youtube.com/shorts/xTy9VHoNrlg)
+
+![Waterfall signal from SX1280 with external PA](img/waterfall1.png)
+*SSB signal on QO-100 waterfall (with external amplifier)*
+
 ## Project Description
 
 SSB (Single Sideband) and digital modes transmitter for the 2.4 GHz band, designed for communication via the narrowband transponder of the geostationary satellite **QO-100 (Es'hail 2)**.
