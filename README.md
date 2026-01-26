@@ -40,6 +40,11 @@ Code generated with assistance from **Claude Opus 4.5** and **GPT 5.2**.
 | LoRa1280F27-TCXO | SX1280 module with PA (+27 dBm) and TCXO |
 | 2.4 GHz Antenna | SMA or u.FL connector |
 
+### Prototype
+
+![Prototype transmitter](img/prototype.png)
+*Prototype transmitter used for QO-100 tests - quick and dirty but it works!*
+
 ## Wiring Diagram
 
 ```
@@ -102,6 +107,16 @@ cp SX1280SDR.uf2 /media/$USER/RPI-RP2/
 1. Connect Pico to computer
 2. Select "SX1280 QO-100 SSB TX" as audio output device
 3. Transmit using any software (SDR, WSJT-X, fldigi, etc.)
+
+### GUI Control Panel
+
+![GUI Control Panel](img/gui.png)
+*Python GUI for real-time control of all TX parameters*
+
+Run the GUI:
+```bash
+python3 gui.py
+```
 
 ### Carrier Mode
 If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
