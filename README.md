@@ -43,6 +43,7 @@ Code generated with assistance from **Claude Opus 4.5** and **GPT 5.2**.
 ### Prototype
 
 ![Prototype transmitter](img/prototype.png)
+
 *Prototype transmitter used for QO-100 tests - quick and dirty but it works!*
 
 ## Wiring Diagram
