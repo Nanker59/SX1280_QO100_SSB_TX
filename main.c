@@ -12,11 +12,15 @@
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
+#include "hardware/i2c.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+
+// OLED display
+#include "ssd1306.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -100,6 +104,18 @@ static const uint32_t PIN_BUSY  = 21;
 static const uint32_t PIN_TCXO_EN = 22;
 #endif
 
+// ---------------- OLED I2C pins ----------------
+#define OLED_I2C       i2c1
+#define OLED_I2C_BAUD  400000
+static const uint32_t PIN_OLED_SDA = 6;
+static const uint32_t PIN_OLED_SCL = 7;
+
+// ---------------- Encoder + buttons ----------------
+static const uint32_t PIN_ENC_A   = 2;   // Encoder phase A
+static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
+static const uint32_t PIN_ENC_OK  = 4;   // Encoder push button
+static const uint32_t PIN_PTT_KEY = 5;   // PTT / CW key
+
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
 static const uint32_t SX_SPI_BAUD = 18000000;
@@ -130,6 +146,33 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
+static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
+static volatile uint8_t g_ptt_key = 0;     // 1 = PTT/KEY pressed (live)
+
+// --- Encoder UI state ---
+typedef enum {
+    UI_PARAM_MODE = 0,   // USB / CW        (col 0, row 0)
+    UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
+    UI_PARAM_MENU,       // MENU placeholder  (col 0, row 2)
+    UI_PARAM_TX,         // TX on/off        (col 1, row 0)
+    UI_PARAM_PPM,        // PPM correction   (col 1, row 1)
+    UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
+    UI_PARAM_COUNT       // sentinel (= 6)
+} ui_param_t;
+
+typedef enum {
+    UI_STATE_IDLE = 0,   // Default: encoder adjusts frequency
+    UI_STATE_BROWSE,     // Click opened menu: frame around item, rotate moves cursor
+    UI_STATE_EDITING     // Click confirmed item: inverted, rotate adjusts value
+} ui_state_t;
+
+static volatile ui_state_t g_ui_state = UI_STATE_IDLE;
+static volatile ui_param_t g_ui_cursor = UI_PARAM_MODE;    // browse cursor position
+static volatile ui_param_t g_ui_editing = UI_PARAM_MODE;   // which param is being edited
+static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
+
+#define UI_TIMEOUT_MS   5000    // Return to IDLE after 5s inactivity
 
 // --- Hilbert ---
 #define HILBERT_TAPS        247
@@ -583,77 +626,233 @@ static void sx_print_diag(void) {
 #endif
 }
 
-// Test CW transmission
-static void sx_test_cw(void) {
-#if CFG_TUD_CDC
-    cdc_printf("\r\n*** Starting CW test ***\r\n");
-    
-    // Signal Core1 to stop SPI operations
-    g_cw_test_mode = 1;
-    sleep_ms(10);  // Wait for Core1 to see flag and stop
-    
-    // Ensure TCXO is on
+// Apply current freq + power to SX1280 while in CW/TUNE mode.
+// Uses fractional-step dithering for sub-PLL-step precision (same as SSB).
+// Call repeatedly from carrier_poll() — each call advances the dither accumulator.
+static float g_cw_freq_acc = 0.0f;  // Fractional step accumulator for CW dithering
+
+static void tune_apply_settings(void) {
+    uint32_t base = get_base_steps();
+    float fine_hz = get_fine_tune_hz();
+
+    // Dither: accumulate fractional PLL step, toggle +1 when it overflows
+    float want_frac = fine_hz / PLL_STEP_HZ;
+    int32_t Nf = (int32_t)floorf(want_frac);
+    float ffrac = want_frac - (float)Nf;
+
+    g_cw_freq_acc += ffrac;
+    int32_t chosen = Nf;
+    if (g_cw_freq_acc >= 1.0f) {
+        chosen = Nf + 1;
+        g_cw_freq_acc -= 1.0f;
+    }
+
+    sx_set_rf_frequency_steps((uint32_t)((int32_t)base + chosen));
+    sx_set_tx_params_dbm(g_tx_power_max_dbm);
+}
+
+// Pump USB while waiting (keep USB alive during short delays)
+static void usb_aware_delay_ms(uint32_t ms) {
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while ((to_ms_since_boot(get_absolute_time()) - start) < ms) {
+        tud_task();
+    }
+}
+
+// Start CW/TUNE carrier (Core0 only).
+// PRECONDITION: g_cw_test_mode must already be 1 and Core1 must be idle.
+static void sx_start_carrier(void) {
+    // Ensure TCXO is on (pump USB while waiting)
 #if USE_TCXO_MODULE
     gpio_put(PIN_TCXO_EN, 1);
-    sleep_ms(5);
-    cdc_printf("TCXO enabled\r\n");
+    usb_aware_delay_ms(5);
 #endif
-    
-    // Set standby
+
+    // Full clean init: standby -> packet type -> freq -> power -> CW
 #if USE_TCXO_MODULE
     sx_set_standby_xosc();
-    cdc_printf("Mode: STDBY_XOSC\r\n");
 #else
     sx_set_standby_rc();
-    cdc_printf("Mode: STDBY_RC\r\n");
 #endif
-    
-    // Packet type
+
     sx_set_packet_type_gfsk();
-    cdc_printf("Packet: GFSK\r\n");
-    
-    // Frequency - use current center freq
+
     uint32_t steps = get_base_steps();
     sx_set_rf_frequency_steps(steps);
-    cdc_printf("Freq: %.1f Hz (steps=%lu)\r\n", g_target_freq_hz, (unsigned long)steps);
-    
-    // Max power
     sx_set_tx_params_dbm(g_tx_power_max_dbm);
-    cdc_printf("Power: %d dBm\r\n", g_tx_power_max_dbm);
-    
-    // Enable PA
+
     gpio_put(PIN_TX_EN, 1);
     gpio_put(PIN_RX_EN, 0);
-    cdc_printf("TX_EN=1, RX_EN=0\r\n");
-    
-    // Start CW
+
     sx_start_tx_continuous_wave();
-    sleep_ms(5);  // Give chip time to start TX
-    uint8_t status = sx_get_status();
-    cdc_printf("Status after CW: 0x%02X (mode=%d)\r\n", status, (status >> 5) & 0x07);
-    
-    if (((status >> 5) & 0x07) == 6) {
-        cdc_printf("*** TX ACTIVE - check spectrum analyzer! ***\r\n");
-    } else {
-        cdc_printf("*** WARNING: TX not active! ***\r\n");
+    usb_aware_delay_ms(2);
+
+    // Safety: re-apply frequency AFTER CW start
+    sx_set_rf_frequency_steps(steps);
+}
+
+// Stop CW carrier and restore for SSB (Core0 only)
+static void sx_stop_carrier(void) {
+#if USE_TCXO_MODULE
+    sx_set_standby_xosc();
+#else
+    sx_set_standby_rc();
+#endif
+
+    // Re-initialize radio for normal SSB operation
+    sx_set_packet_type_gfsk();
+    sx_set_rf_frequency_steps(get_base_steps());
+    sx_set_tx_params_dbm((int32_t)g_tx_power_max_dbm);
+
+    gpio_put(PIN_TX_EN, 1);
+    gpio_put(PIN_RX_EN, 0);
+
+    // Resume normal Core1 operation
+    g_cw_test_mode = 0;
+    __compiler_memory_barrier();
+}
+
+#define CW_ARM_WAIT_MS  35  // Time to wait for Core1 to finish SPI (> 1 block = 32ms)
+
+// Start CW/TUNE transmission (legacy wrapper with CDC logging)
+// This is a blocking call (used by CDC "cw" command and TUNE encoder action).
+// It idles Core1, waits (USB-aware), then starts carrier.
+static void sx_test_cw(void) {
+#if CFG_TUD_CDC
+    cdc_printf("\r\n*** Starting CW/TUNE ***\r\n");
+#endif
+    // Idle Core1 and wait (USB-aware, not blocking)
+    if (!g_cw_test_mode) {
+        g_cw_test_mode = 1;
+        __compiler_memory_barrier();
+        usb_aware_delay_ms(CW_ARM_WAIT_MS);
     }
+    sx_start_carrier();
+#if CFG_TUD_CDC
+    uint8_t status = sx_get_status();
+    cdc_printf("TUNE: freq=%.1f Hz, steps=%lu, pwr=%d dBm, status=0x%02X\r\n",
+               get_corrected_freq_hz(), (unsigned long)get_base_steps(),
+               g_tx_power_max_dbm, status);
 #endif
 }
 
-// Stop CW transmission
+// Stop CW transmission and restore normal SSB mode (legacy wrapper)
 static void sx_stop_cw(void) {
+    sx_stop_carrier();
 #if CFG_TUD_CDC
-    gpio_put(PIN_TX_EN, 0);
+    cdc_printf("TX stopped, radio re-initialized for SSB\r\n");
+#endif
+}
+
+// ==========================================================
+// Unified carrier state machine (runs on Core0 in polling loop)
+//
+// Inputs:  g_tx_mode (0=USB, 1=CW), g_tune_active, g_ptt_key
+// Outputs: g_cw_test_mode, SPI carrier on/off
+//
+// Logic:
+//   need_idle  = (g_tx_mode==1) || g_tune_active     → Core1 must idle
+//   need_carrier = g_tune_active || (g_tx_mode==1 && g_ptt_key)  → CW on
+//
+// States:
+//   IDLE    → need_idle? set g_cw_test_mode=1, go ARMING
+//   ARMING  → wait 35ms for Core1, go ARMED
+//   ARMED   → need_carrier? sx_start_carrier → CARRIER_ON
+//   CARRIER_ON → !need_carrier? standby → ARMED
+//   any     → !need_idle? stop carrier if on, clear g_cw_test_mode → IDLE
+// ==========================================================
+typedef enum {
+    CR_ST_IDLE = 0,     // Normal SSB mode — Core1 owns SPI
+    CR_ST_ARMING,       // g_cw_test_mode=1 set, waiting for Core1 to idle
+    CR_ST_ARMED,        // Core1 is idle, no carrier (standby)
+    CR_ST_CARRIER_ON    // CW carrier active
+} carrier_state_t;
+
+static carrier_state_t g_cr_state = CR_ST_IDLE;
+static uint32_t        g_cr_arm_start_ms = 0;
+
+static void carrier_poll(void) {
+    bool mode_cw     = (g_tx_mode == 1);
+    bool tune        = (bool)g_tune_active;
+    bool key         = (bool)g_ptt_key;
+
+    bool need_idle    = mode_cw || tune;
+    bool need_carrier = tune || (mode_cw && key);
+
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    switch (g_cr_state) {
+
+    case CR_ST_IDLE:
+        if (need_idle) {
+            g_cw_test_mode = 1;
+            __compiler_memory_barrier();
+            g_cr_arm_start_ms = now;
+            g_cr_state = CR_ST_ARMING;
+        }
+        break;
+
+    case CR_ST_ARMING:
+        if (!need_idle) {
+            // No longer need idle — cancel
+            g_cw_test_mode = 0;
+            __compiler_memory_barrier();
+            g_cr_state = CR_ST_IDLE;
+            break;
+        }
+        if ((now - g_cr_arm_start_ms) >= CW_ARM_WAIT_MS) {
+            // Core1 is now idle — force radio to known standby state
+            // (Core1 may have left it in TX from SSB)
 #if USE_TCXO_MODULE
-    sx_set_standby_xosc();
+            sx_set_standby_xosc();
 #else
-    sx_set_standby_rc();
+            sx_set_standby_rc();
 #endif
-    cdc_printf("TX stopped, back to standby\r\n");
-    
-    // Resume normal Core1 operation
-    g_cw_test_mode = 0;
+            g_cr_state = CR_ST_ARMED;
+        }
+        break;
+
+    case CR_ST_ARMED:
+        if (!need_idle) {
+            // Return to SSB — restore Core1
+            g_cw_test_mode = 0;
+            __compiler_memory_barrier();
+            g_cr_state = CR_ST_IDLE;
+            break;
+        }
+        if (need_carrier) {
+            g_cw_freq_acc = 0.0f;  // Reset dither accumulator
+            sx_start_carrier();
+            g_cr_state = CR_ST_CARRIER_ON;
+        }
+        break;
+
+    case CR_ST_CARRIER_ON:
+        if (!need_idle) {
+            // Leaving CW/TUNE entirely — full stop + restore SSB
+            sx_stop_carrier();   // clears g_cw_test_mode
+            g_cr_state = CR_ST_IDLE;
+            break;
+        }
+        if (!need_carrier) {
+            // Carrier off but stay armed (e.g. CW key released, or TUNE off but still CW mode)
+#if USE_TCXO_MODULE
+            sx_set_standby_xosc();
+#else
+            sx_set_standby_rc();
 #endif
+            g_cr_state = CR_ST_ARMED;
+        } else {
+            // Carrier on — dither freq at ~8 kHz (125 µs), same rate as SSB
+            static uint64_t next_dither_us = 0;
+            uint64_t now_us = time_us_64();
+            if (now_us >= next_dither_us) {
+                tune_apply_settings();
+                next_dither_us = now_us + 125;  // 125 µs = 8 kHz
+            }
+        }
+        break;
+    }
 }
 
 // ==========================================================
@@ -977,6 +1176,15 @@ static bool parse_f(const char *s, float *out) {
     return true;
 }
 
+// Format large Hz value as "XXXXXXXXXX.X" into caller's buffer.
+// Needed because newlib-nano's printf uses scientific notation for big doubles.
+static void fmt_freq(char *buf, size_t len, double hz) {
+    uint64_t i = (uint64_t)hz;
+    uint32_t f = (uint32_t)((hz - (double)i) * 10.0 + 0.5);
+    if (f >= 10) { i++; f = 0; }
+    snprintf(buf, len, "%llu.%u", (unsigned long long)i, (unsigned)f);
+}
+
 static void cfg_print(void) {
     audio_cfg_t c;
     __compiler_memory_barrier();
@@ -986,18 +1194,25 @@ static void cfg_print(void) {
     double corrected = get_corrected_freq_hz();
     float fine = get_fine_tune_hz();
 
+    char freq_str[24], corr_str[24];
+    fmt_freq(freq_str, sizeof(freq_str), g_target_freq_hz);
+    fmt_freq(corr_str, sizeof(corr_str), corrected);
+
     cdc_printf(
         "CFG:\r\n"
-        "  freq=%.1f Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
-        "  corrected=%.1f Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n"
+        "  freq=%s Hz (target)  ppm=%.3f  tx=%s  txpwr=%d dBm\r\n"
+        "  mode=%s  tune=%s\r\n"
+        "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
+        freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
+        g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
+        corr_str, (unsigned long)get_base_steps(), fine);
+    cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
         "  bp_lo=%.1f bp_hi=%.1f bp_stages=%u (%u dB/oct)\r\n"
         "  eq_low_hz=%.1f eq_low_db=%.1f\r\n"
         "  eq_high_hz=%.1f eq_high_db=%.1f\r\n"
         "  comp_thr=%.1f ratio=%.2f att=%.2fms rel=%.2fms makeup=%.1f knee=%.1f outlim=%.3f\r\n"
         "  amp_gain=%.3f amp_min_a=%.9f\r\n",
-        g_target_freq_hz, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
-        corrected, (unsigned long)get_base_steps(), fine,
         c.enable_bandpass, c.enable_eq, c.enable_comp,
         c.bp_lo_hz, c.bp_hi_hz, c.bp_stages, c.bp_stages * 12,
         c.eq_low_hz, c.eq_low_db,
@@ -1014,6 +1229,8 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
+        "  mode usb|cw   - set modulation mode\r\n"
+        "  tune 0|1      - toggle TUNE carrier\r\n"
         "  cw            - start CW test transmission\r\n"
         "  stop          - stop CW transmission\r\n"
         "  freq <Hz>     - set frequency with sub-Hz precision (e.g. freq 2400100050.5)\r\n"
@@ -1048,6 +1265,71 @@ static void cfg_commit(const audio_cfg_t *c) {
     __compiler_memory_barrier();
 }
 
+// Periodic status push to CDC for GUI synchronization.
+// Sends a compact line that the GUI can parse to update its widgets.
+// Only sends when something changed, at most every 250 ms.
+#if CFG_TUD_CDC
+static void cdc_status_push_ex(bool force) {
+    static uint32_t last_push_ms = 0;
+    static uint8_t  last_mode = 0xFF;
+    static uint8_t  last_tune = 0xFF;
+    static uint8_t  last_tx   = 0xFF;
+    static int8_t   last_pwr  = 127;
+    static float    last_ppm  = 9999.0f;
+    static double   last_freq = 0.0;
+
+    if (!tud_cdc_connected()) return;
+
+    uint8_t  cur_mode = g_tx_mode;
+    uint8_t  cur_tune = g_tune_active;
+    uint8_t  cur_tx   = g_tx_enabled;
+    int8_t   cur_pwr  = g_tx_power_max_dbm;
+    float    cur_ppm  = g_ppm_correction;
+    double   cur_freq = (double)g_target_freq_hz;
+
+    if (!force) {
+        // Check if anything changed
+        bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
+                       (cur_tx != last_tx) || (cur_pwr != last_pwr) ||
+                       (cur_ppm != last_ppm) || (cur_freq != last_freq);
+
+        if (!changed) return;
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((now - last_push_ms) < 100) return;
+    }
+
+    // Format freq with fmt_freq to avoid newlib-nano scientific notation
+    char freq_str[24];
+    fmt_freq(freq_str, sizeof(freq_str), cur_freq);
+
+    // PPM: format as fixed-point (4 decimals) to avoid float formatting issues
+    int ppm_neg = (cur_ppm < 0.0f);
+    float ppm_abs = ppm_neg ? -cur_ppm : cur_ppm;
+    uint32_t ppm_int = (uint32_t)ppm_abs;
+    uint32_t ppm_frac = (uint32_t)((ppm_abs - (float)ppm_int) * 10000.0f + 0.5f);
+    if (ppm_frac >= 10000) { ppm_int++; ppm_frac = 0; }
+
+    char status_buf[128];
+    snprintf(status_buf, sizeof(status_buf),
+             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
+             cur_mode, cur_tune, cur_tx, cur_pwr,
+             ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
+             freq_str);
+    cdc_write_str(status_buf);
+
+    last_mode = cur_mode;
+    last_tune = cur_tune;
+    last_tx   = cur_tx;
+    last_pwr  = cur_pwr;
+    last_ppm  = cur_ppm;
+    last_freq = cur_freq;
+    last_push_ms = to_ms_since_boot(get_absolute_time());
+}
+
+static inline void cdc_status_push(void) { cdc_status_push_ex(false); }
+#endif
+
 static void cdc_handle_line(char *line) {
     char *argv[6] = {0};
     int argc = 0;
@@ -1059,9 +1341,37 @@ static void cdc_handle_line(char *line) {
 
     if (streqi(argv[0], "help")) { cmd_help(); return; }
     if (streqi(argv[0], "get"))  { cfg_print(); return; }
+    if (streqi(argv[0], "status")) { cdc_status_push_ex(true); return; }
     if (streqi(argv[0], "diag")) { sx_print_diag(); return; }
-    if (streqi(argv[0], "cw"))   { sx_test_cw(); return; }
-    if (streqi(argv[0], "stop")) { sx_stop_cw(); return; }
+    if (streqi(argv[0], "cw"))   { g_tune_active = 1; cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n"); return; }
+    if (streqi(argv[0], "stop")) { g_tune_active = 0; cdc_printf("OK tune=OFF\r\n"); return; }
+
+    // Mode: mode usb|cw
+    if (streqi(argv[0], "mode") && argc >= 2) {
+        if (streqi(argv[1], "usb") || streqi(argv[1], "ssb")) {
+            g_tx_mode = 0;
+            cdc_printf("OK mode=USB\r\n");
+        } else if (streqi(argv[1], "cw")) {
+            g_tx_mode = 1;
+            cdc_printf("OK mode=CW\r\n");
+        } else {
+            cdc_write_str("ERR: mode usb|cw\r\n");
+        }
+        return;
+    }
+
+    // Tune carrier: tune 0|1
+    if (streqi(argv[0], "tune") && argc >= 2) {
+        uint8_t v;
+        if (!parse_bool(argv[1], &v)) {
+            cdc_write_str("ERR: tune 0|1|on|off\r\n");
+            return;
+        }
+        g_tune_active = v;
+        // carrier_poll() will handle SPI transitions
+        cdc_printf("OK tune=%s\r\n", g_tune_active ? "ON" : "OFF");
+        return;
+    }
 
     // TX enable/disable: tx 0|1
     if (streqi(argv[0], "tx") && argc >= 2) {
@@ -1089,6 +1399,7 @@ static void cdc_handle_line(char *line) {
         cdc_printf("OK freq=%.1f Hz (corrected=%.1f, steps=%lu, fine=%.1f Hz)\r\n", 
                    g_target_freq_hz, corrected,
                    (unsigned long)get_base_steps(), fine);
+        if (g_tune_active) tune_apply_settings();
         return;
     }
 
@@ -1109,6 +1420,7 @@ static void cdc_handle_line(char *line) {
         cdc_printf("OK ppm=%.3f (corrected=%.1f Hz, steps=%lu, fine=%.1f Hz)\r\n", 
                    g_ppm_correction, corrected,
                    (unsigned long)get_base_steps(), fine);
+        if (g_tune_active) tune_apply_settings();
         return;
     }
 
@@ -1123,6 +1435,7 @@ static void cdc_handle_line(char *line) {
         if (pwr > (float)PWR_MAX_DBM) pwr = (float)PWR_MAX_DBM;
         g_tx_power_max_dbm = (int8_t)pwr;
         cdc_printf("OK txpwr=%d dBm\r\n", g_tx_power_max_dbm);
+        if (g_tune_active) tune_apply_settings();
         return;
     }
 
@@ -1201,6 +1514,377 @@ static void cdc_task(void) {
 }
 
 // ==========================================================
+// OLED display — simple text, DMA transfer
+// ==========================================================
+#define QO100_DOWNLINK_OFFSET_HZ  8089500000.0
+
+// Helper: right-justify a 1x string ending at x_right edge
+static void draw_string_right(int x_right, int page, const char *str) {
+    int len = 0;
+    const char *p = str;
+    while (*p++) len++;
+    int x = x_right - len * 6;
+    ssd1306_draw_string(x, page, str);
+}
+
+// Draw a 2x-height arrow-up glyph into framebuf at (x, page..page+1)
+static void draw_arrow_up_2x(int x, int page) {
+    static const uint8_t src[] = {0x04, 0x02, 0x7F, 0x02, 0x04};
+    uint8_t *fb = ssd1306_get_framebuf();
+    for (int c = 0; c < 5; c++) {
+        uint16_t expanded = 0;
+        for (int b = 0; b < 7; b++)
+            if (src[c] & (1 << b)) expanded |= (3u << (b * 2));
+        uint8_t lo = (uint8_t)(expanded & 0xFF);
+        uint8_t hi = (uint8_t)((expanded >> 8) & 0xFF);
+        for (int dx = 0; dx < 2; dx++) {
+            int px = x + c * 2 + dx;
+            if (px >= 0 && px < SSD1306_WIDTH) {
+                fb[page * SSD1306_WIDTH + px] = lo;
+                fb[(page + 1) * SSD1306_WIDTH + px] = hi;
+            }
+        }
+    }
+}
+
+// Draw a 2x-height arrow-down glyph into framebuf at (x, page..page+1)
+static void draw_arrow_down_2x(int x, int page) {
+    static const uint8_t src[] = {0x10, 0x20, 0x7F, 0x20, 0x10};
+    uint8_t *fb = ssd1306_get_framebuf();
+    for (int c = 0; c < 5; c++) {
+        uint16_t expanded = 0;
+        for (int b = 0; b < 7; b++)
+            if (src[c] & (1 << b)) expanded |= (3u << (b * 2));
+        uint8_t lo = (uint8_t)(expanded & 0xFF);
+        uint8_t hi = (uint8_t)((expanded >> 8) & 0xFF);
+        for (int dx = 0; dx < 2; dx++) {
+            int px = x + c * 2 + dx;
+            if (px >= 0 && px < SSD1306_WIDTH) {
+                fb[page * SSD1306_WIDTH + px] = lo;
+                fb[(page + 1) * SSD1306_WIDTH + px] = hi;
+            }
+        }
+    }
+}
+
+// Draw radio-on icon at pixel (x, y): dot + 2 arcs, 7px tall, ~9px wide
+static void draw_radio_on_xy(int x, int y) {
+    // Dot 2x2 at center height (y+2, y+3)
+    ssd1306_set_pixel(x,   y+2, true); ssd1306_set_pixel(x,   y+3, true);
+    ssd1306_set_pixel(x+1, y+2, true); ssd1306_set_pixel(x+1, y+3, true);
+    // Arc 1
+    ssd1306_set_pixel(x+3, y+1, true);
+    ssd1306_set_pixel(x+3, y+2, true); ssd1306_set_pixel(x+3, y+3, true);
+    ssd1306_set_pixel(x+3, y+4, true);
+    // Arc 2
+    ssd1306_set_pixel(x+5, y+0, true);
+    ssd1306_set_pixel(x+5, y+1, true);
+    ssd1306_set_pixel(x+5, y+2, true); ssd1306_set_pixel(x+5, y+3, true);
+    ssd1306_set_pixel(x+5, y+4, true);
+    ssd1306_set_pixel(x+5, y+5, true);
+}
+
+// Draw radio-off icon at pixel (x, y): just a dot, 7px tall, 2px wide
+static void draw_radio_off_xy(int x, int y) {
+    ssd1306_set_pixel(x,   y+2, true); ssd1306_set_pixel(x,   y+3, true);
+    ssd1306_set_pixel(x+1, y+2, true); ssd1306_set_pixel(x+1, y+3, true);
+}
+
+// Prepare framebuffer content (fast, no I2C)
+static void oled_prepare_frame(void) {
+    double freq = g_target_freq_hz;
+    double downlink = freq + QO100_DOWNLINK_OFFSET_HZ;
+
+    ssd1306_clear();
+
+    // --- Row 0 (pages 0-1): ↑ arrow + right-justified uplink freq ---
+    draw_arrow_up_2x(0, 0);
+    {
+        char buf[20];
+        uint32_t khz_total = (uint32_t)(freq / 1000.0);
+        uint32_t frac = (uint32_t)((freq - (double)khz_total * 1000.0) / 100.0 + 0.5);
+        if (frac >= 10) { frac -= 10; khz_total++; }
+        snprintf(buf, sizeof(buf), "%lu.%lu", (unsigned long)khz_total, (unsigned long)frac);
+        // Right-justify 2x text: each char = 12px
+        int len = 0; { const char *p = buf; while (*p++) len++; }
+        int x_start = 128 - len * 12;
+        ssd1306_draw_string_2x(x_start, 0, buf);
+    }
+
+    // --- Row 1 (pages 2-3): ↓ arrow + right-justified downlink freq ---
+    draw_arrow_down_2x(0, 2);
+    {
+        char buf[20];
+        uint32_t khz_total = (uint32_t)(downlink / 1000.0);
+        uint32_t frac = (uint32_t)((downlink - (double)khz_total * 1000.0) / 100.0 + 0.5);
+        if (frac >= 10) { frac -= 10; khz_total++; }
+        snprintf(buf, sizeof(buf), "%lu.%lu", (unsigned long)khz_total, (unsigned long)frac);
+        int len = 0; { const char *p = buf; while (*p++) len++; }
+        int x_start = 128 - len * 12;
+        ssd1306_draw_string_2x(x_start, 2, buf);
+    }
+
+    // --- Separator line at y=32 ---
+    ssd1306_hline(0, 127, 32);
+
+    // --- Bottom half: 2 columns × 3 rows, all navigable ---
+    // Vertical divider at x=63
+    ssd1306_vline(63, 33, 63);
+
+    // Column positions and widths
+    const int COL0_X = 2;    // left column text start
+    const int COL0_W = 60;   // left column field width for inverted rendering
+    const int COL0_R = 61;   // left column right edge for frame
+    const int COL1_X = 66;   // right column text start
+    const int COL1_W = 60;   // right column field width
+    const int COL1_R = 126;  // right column right edge for frame
+    // Row Y positions (stride 10: 7px text + 3px gap)
+    const int ROW0_Y = 34;
+    const int ROW1_Y = 44;
+    const int ROW2_Y = 54;
+
+    // Helper macro: draw a navigable item in either column
+    #define DRAW_ITEM(col_x, col_w, col_l, col_r, y_pos, text, param_id) do { \
+        if (g_ui_state == UI_STATE_EDITING && g_ui_editing == (param_id)) { \
+            /* EDITING: inverted (white bg, black text) */ \
+            ssd1306_draw_string_bold_y_inv((col_x), (y_pos), (text), (col_w)); \
+        } else if (g_ui_state == UI_STATE_BROWSE && g_ui_cursor == (param_id)) { \
+            /* BROWSE: frame around this item */ \
+            ssd1306_draw_string_bold_y((col_x), (y_pos), (text)); \
+            ssd1306_hline((col_l), (col_r), (y_pos)-1); \
+            ssd1306_hline((col_l), (col_r), (y_pos)+8); \
+            ssd1306_vline((col_l), (y_pos)-1, (y_pos)+8); \
+            ssd1306_vline((col_r), (y_pos)-1, (y_pos)+8); \
+        } else { \
+            /* IDLE or non-selected: normal text */ \
+            ssd1306_draw_string_bold_y((col_x), (y_pos), (text)); \
+        } \
+    } while(0)
+
+    // Shorthand for left/right columns
+    #define DRAW_L(y, text, pid) DRAW_ITEM(COL0_X, COL0_W, 0,  COL0_R, y, text, pid)
+    #define DRAW_R(y, text, pid) DRAW_ITEM(COL1_X, COL1_W, 64, COL1_R, y, text, pid)
+
+    // --- Column 0 (left) ---
+    // Row 0: Mode (USB / CW)
+    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : "USB", UI_PARAM_MODE);
+
+    // Row 1: TUNE
+    DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
+
+    // Row 2: MENU (placeholder)
+    DRAW_L(ROW2_Y, "MENU", UI_PARAM_MENU);
+
+    // --- Column 1 (right) ---
+    // Row 0: TX ON/OFF + radio icon
+    {
+        const char *tx_label;
+        if (g_tx_mode == 1 && g_ptt_key) {
+            tx_label = "KEY";
+        } else {
+            tx_label = g_tx_enabled ? "TX ON" : "TX OFF";
+        }
+        DRAW_R(ROW0_Y, tx_label, UI_PARAM_TX);
+    }
+
+    // Row 1: PPM
+    {
+        char ppm_buf[12];
+        snprintf(ppm_buf, sizeof(ppm_buf), "%+.2f", (double)g_ppm_correction);
+        DRAW_R(ROW1_Y, ppm_buf, UI_PARAM_PPM);
+    }
+
+    // Row 2: Power
+    {
+        char pwr_buf[12];
+        snprintf(pwr_buf, sizeof(pwr_buf), "%+ddBm", g_tx_power_max_dbm);
+        DRAW_R(ROW2_Y, pwr_buf, UI_PARAM_PWR);
+    }
+
+    #undef DRAW_ITEM
+    #undef DRAW_L
+    #undef DRAW_R
+}
+
+// ==========================================================
+// Encoder + Button polling (Core0, called from idle loop)
+// ==========================================================
+
+// Encoder state machine (Gray code quadrature)
+static uint8_t enc_last_ab = 0;
+static int8_t  enc_accum = 0;
+
+// Button debounce state
+static uint8_t  ok_was_pressed = 0;
+static uint32_t ok_debounce_ms = 0;
+static uint32_t ptt_debounce_ms = 0;
+static uint8_t  ptt_last_state = 0;
+
+#define DEBOUNCE_MS         5
+
+// Frequency step for encoder (Hz)
+#define ENC_FREQ_STEP_HZ   100.0
+
+static inline void ui_touch(void) {
+    g_ui_last_activity_ms = to_ms_since_boot(get_absolute_time());
+}
+
+static void encoder_poll(void) {
+    // Read encoder pins (active LOW with pull-up)
+    uint8_t a = gpio_get(PIN_ENC_A) ? 0 : 1;
+    uint8_t b = gpio_get(PIN_ENC_B) ? 0 : 1;
+    uint8_t ab = (a << 1) | b;
+
+    if (ab == enc_last_ab) return;
+
+    // Quadrature decode via state transition table
+    static const int8_t enc_table[16] = {
+         0, -1, +1,  0,
+        +1,  0,  0, -1,
+        -1,  0,  0, +1,
+         0, +1, -1,  0
+    };
+    int8_t dir = enc_table[(enc_last_ab << 2) | ab];
+    enc_last_ab = ab;
+
+    if (dir == 0) return;
+
+    // Accumulate — only act on full detent (4 edges per click)
+    enc_accum += dir;
+    int step = 0;
+    if (enc_accum >= 4) {
+        step = +1;
+        enc_accum = 0;
+    } else if (enc_accum <= -4) {
+        step = -1;
+        enc_accum = 0;
+    } else {
+        return;  // Not a full step yet
+    }
+
+    ui_touch();
+
+    switch (g_ui_state) {
+        case UI_STATE_IDLE:
+            // Default: encoder adjusts frequency
+            {
+                double f = g_target_freq_hz + step * ENC_FREQ_STEP_HZ;
+                if (f < 2400000000.0) f = 2400000000.0;
+                if (f > 2500000000.0) f = 2500000000.0;
+                g_target_freq_hz = f;
+                if (g_tune_active) tune_apply_settings();
+            }
+            break;
+
+        case UI_STATE_BROWSE:
+            // Move cursor between params
+            {
+                int c = (int)g_ui_cursor + step;
+                if (c < 0) c = UI_PARAM_COUNT - 1;
+                if (c >= (int)UI_PARAM_COUNT) c = 0;
+                g_ui_cursor = (ui_param_t)c;
+            }
+            break;
+
+        case UI_STATE_EDITING:
+            // Adjust value of selected param
+            switch (g_ui_editing) {
+                case UI_PARAM_MODE:
+                    g_tx_mode = g_tx_mode ? 0 : 1;
+                    break;
+                case UI_PARAM_TUNE:
+                    if (step > 0 && !g_tune_active) {
+                        g_tune_active = 1;
+                        // carrier_poll() will arm Core1 idle + start carrier
+                    } else if (step < 0 && g_tune_active) {
+                        g_tune_active = 0;
+                        // carrier_poll() will stop carrier (or keep idle if CW mode)
+                    }
+                    break;
+                case UI_PARAM_MENU:
+                    // Placeholder — no action yet
+                    break;
+                case UI_PARAM_TX:
+                    g_tx_enabled = g_tx_enabled ? 0 : 1;
+                    break;
+                case UI_PARAM_PPM:
+                    {
+                        float ppm = g_ppm_correction + (float)step * 0.01f;
+                        if (ppm < -50.0f) ppm = -50.0f;
+                        if (ppm >  50.0f) ppm =  50.0f;
+                        g_ppm_correction = ppm;
+                        if (g_tune_active) tune_apply_settings();
+                    }
+                    break;
+                case UI_PARAM_PWR:
+                    {
+                        int8_t p = g_tx_power_max_dbm + (int8_t)step;
+                        if (p < PWR_MIN_DBM) p = PWR_MIN_DBM;
+                        if (p > PWR_MAX_DBM) p = PWR_MAX_DBM;
+                        g_tx_power_max_dbm = p;
+                        if (g_tune_active) tune_apply_settings();
+                    }
+                    break;
+                default: break;
+            }
+            break;
+    }
+}
+
+static void button_poll(void) {
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
+    // --- Timeout: return to IDLE after 5s ---
+    if (g_ui_state != UI_STATE_IDLE) {
+        if ((now_ms - g_ui_last_activity_ms) >= UI_TIMEOUT_MS) {
+            g_ui_state = UI_STATE_IDLE;
+        }
+    }
+
+    // --- OK button (encoder push) ---
+    uint8_t ok_raw = gpio_get(PIN_ENC_OK) ? 0 : 1;  // Active LOW
+
+    if (ok_raw != ok_was_pressed && (now_ms - ok_debounce_ms) >= DEBOUNCE_MS) {
+        ok_debounce_ms = now_ms;
+        ok_was_pressed = ok_raw;
+
+        if (ok_raw) {
+            // Button just pressed
+            ui_touch();
+
+            switch (g_ui_state) {
+                case UI_STATE_IDLE:
+                    // Enter browse mode
+                    g_ui_state = UI_STATE_BROWSE;
+                    g_ui_cursor = UI_PARAM_MODE;  // start at first item
+                    break;
+
+                case UI_STATE_BROWSE:
+                    // Confirm selection — enter editing mode
+                    g_ui_editing = g_ui_cursor;
+                    g_ui_state = UI_STATE_EDITING;
+                    break;
+
+                case UI_STATE_EDITING:
+                    // Deselect — back to browse mode
+                    g_ui_state = UI_STATE_BROWSE;
+                    break;
+            }
+        }
+    }
+
+    // --- PTT/KEY button ---
+    uint8_t ptt_raw = gpio_get(PIN_PTT_KEY) ? 0 : 1;  // Active LOW
+
+    if (ptt_raw != ptt_last_state && (now_ms - ptt_debounce_ms) >= DEBOUNCE_MS) {
+        ptt_debounce_ms = now_ms;
+        ptt_last_state = ptt_raw;
+        g_ptt_key = ptt_raw;
+        // CW keying is handled by Core1 directly via g_ptt_key — no action here
+    }
+}
+
+// ==========================================================
 // Hilbert
 // ==========================================================
 static float hilb_h[HILBERT_TAPS];
@@ -1271,11 +1955,6 @@ static void core1_radio_apply_loop(void) {
     const uint32_t substeps = (DITHER_SUBSTEPS <= 1) ? 1u : (uint32_t)DITHER_SUBSTEPS;
     const uint32_t sub_period_us = (substeps == 1) ? sample_period_us : (sample_period_us / substeps);
 
-    // *** Wait for Core0 to signal start (after pre-buffering) ***
-    while (!g_core1_start) {
-        tight_loop_contents();
-    }
-
 #if UNDERRUN_LED_ENABLE
     const uint led_pin = PICO_DEFAULT_LED_PIN;
     if (led_pin != (uint)-1) {
@@ -1293,9 +1972,28 @@ static void core1_radio_apply_loop(void) {
     bool tx_en_activated = false;  // Track if we've enabled the PA
 
     while (true) {
-        // If CW test mode is active, skip SPI operations
+        // === CW test / CW mode / TUNE: Core0 owns SPI, Core1 idles ===
         if (g_cw_test_mode) {
+            last_tx_on = false;
+            last_steps = 0x7FFFFFFF;
+            last_p_dbm = 9999;
+            // Drain all blocks so Core0 doesn't stall
+            for (;;) {
+                uint32_t b = g_cons_block;
+                if (!g_block_ready[b]) break;
+                __compiler_memory_barrier();
+                g_block_ready[b] = 0;
+                __compiler_memory_barrier();
+                g_cons_block = (b + 1u) % NUM_BLOCKS;
+            }
             sleep_ms(10);
+            continue;
+        }
+
+        // === SSB MODE: normal audio processing ===
+        // Wait for Core0 to pre-buffer before processing SSB audio
+        if (!g_core1_start) {
+            sleep_ms(1);
             continue;
         }
 
@@ -1461,10 +2159,30 @@ int main(void) {
     gpio_init(PIN_RESET); gpio_set_dir(PIN_RESET, GPIO_OUT); gpio_put(PIN_RESET, 1);
     gpio_init(PIN_BUSY);  gpio_set_dir(PIN_BUSY, GPIO_IN);
 
+    // --- Encoder + button GPIO init (input with pull-up, active LOW) ---
+    gpio_init(PIN_ENC_A);   gpio_set_dir(PIN_ENC_A, GPIO_IN);   gpio_pull_up(PIN_ENC_A);
+    gpio_init(PIN_ENC_B);   gpio_set_dir(PIN_ENC_B, GPIO_IN);   gpio_pull_up(PIN_ENC_B);
+    gpio_init(PIN_ENC_OK);  gpio_set_dir(PIN_ENC_OK, GPIO_IN);  gpio_pull_up(PIN_ENC_OK);
+    gpio_init(PIN_PTT_KEY); gpio_set_dir(PIN_PTT_KEY, GPIO_IN); gpio_pull_up(PIN_PTT_KEY);
+    // Initialize encoder last state
+    enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
+
     spi_init(SX_SPI, SX_SPI_BAUD);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
+
+    // --- OLED I2C init ---
+    i2c_init(OLED_I2C, OLED_I2C_BAUD);
+    gpio_set_function(PIN_OLED_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_OLED_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_OLED_SDA);
+    gpio_pull_up(PIN_OLED_SCL);
+    ssd1306_init(OLED_I2C);
+    ssd1306_clear();
+    ssd1306_draw_string(0, 0, "SX1280 SSB TX");
+    ssd1306_draw_string(0, 2, "Booting...");
+    ssd1306_display(OLED_I2C);
 
     // Hardware reset SX1280
     printf("[SX1280] Resetting...\n");
@@ -1502,48 +2220,34 @@ int main(void) {
     while (true) { tud_task(); tight_loop_contents(); }
 #endif
 
-    // *** USB TIMEOUT: If no USB connection within 10 seconds, start beacon CW on 2400.3 MHz ***
+    // *** Start Core1 early so it can idle and drain blocks immediately ***
+    multicore_launch_core1(core1_radio_apply_loop);
+
+    // Wait for USB — meanwhile handle encoder, buttons, OLED, CW keying
     {
-        const uint32_t USB_TIMEOUT_MS = 10000;
-        const uint32_t BEACON_FREQ_HZ = 2400300000u;
-        
-        printf("[BOOT] Waiting for USB connection (timeout %lu ms)...\n", (unsigned long)USB_TIMEOUT_MS);
-        
-        absolute_time_t deadline = make_timeout_time_ms(USB_TIMEOUT_MS);
-        
+        printf("[BOOT] Waiting for USB connection (encoder+CW active)...\n");
+        absolute_time_t oled_next = {0};
+
         while (!tud_ready()) {
             tud_task();
-            
-            if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-                // Timeout! Start beacon mode
-                printf("[BOOT] USB timeout - starting beacon CW on %.3f MHz\n", 
-                       (float)BEACON_FREQ_HZ / 1000000.0f);
-                
-                g_target_freq_hz = (double)BEACON_FREQ_HZ;
-                g_ppm_correction = 0.0f;
-                
-                sx_set_rf_frequency_steps(get_base_steps());
-                sx_set_tx_params_dbm((int32_t)g_tx_power_max_dbm);
-                gpio_put(PIN_TX_EN, 1);
-                sx_start_tx_continuous_wave();
-                
-                // Stay in beacon mode forever (or until power cycle)
-                while (true) {
-                    tud_task();
-                    sleep_ms(100);
-                    
-                    // If USB connects later, could optionally exit beacon mode
-                    // For now, stay in CW beacon
-                }
+            encoder_poll();
+            button_poll();
+            carrier_poll();
+
+            // OLED refresh during wait
+            if (!ssd1306_dma_busy() &&
+                absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
+                oled_prepare_frame();
+                ssd1306_display_dma(OLED_I2C);
+                oled_next = make_timeout_time_ms(200);
             }
-            
-            sleep_ms(10);
+
+            sleep_ms(1);
         }
-        
         printf("[BOOT] USB connected, starting normal SSB mode\n");
     }
 
-    hilbert_init();;
+    hilbert_init();
 
     const float Fs = (float)WAV_SAMPLE_RATE;
 
@@ -1597,9 +2301,6 @@ int main(void) {
     // greet once if CDC is connected later
     uint8_t greeted = 0;
 
-    // *** Start Core1 (it will wait for g_core1_start signal) ***
-    multicore_launch_core1(core1_radio_apply_loop);
-
     // *** Pre-fill some blocks before signaling Core1 to start ***
     const uint32_t prebuf_target = NUM_BLOCKS / 2;  // Fill half the buffer
     uint32_t prebuf_count = 0;
@@ -1607,8 +2308,61 @@ int main(void) {
     while (true) {
         uint32_t b = g_prod_block;
 
+        // === CW/TUNE active: Core1 just drains blocks, no DSP needed ===
+        // Run a tight poll loop instead of producing audio blocks.
+        // Without this, Core1 drains so fast that the wait loop below
+        // never executes, starving encoder/button/cw_keying polls.
+        if (g_cw_test_mode) {
+            usb_audio_pump();
+
+            {
+                static absolute_time_t oled_next_cw = {0};
+                if (!ssd1306_dma_busy() &&
+                    absolute_time_diff_us(get_absolute_time(), oled_next_cw) <= 0) {
+                    oled_prepare_frame();
+                    ssd1306_display_dma(OLED_I2C);
+                    oled_next_cw = make_timeout_time_ms(200);
+                }
+            }
+
+            encoder_poll();
+            button_poll();
+            carrier_poll();
+
+#if CFG_TUD_CDC
+            cdc_task();
+            cdc_status_push();
+#endif
+            tight_loop_contents();
+            continue;   // Skip block production entirely
+        }
+
         while (g_block_ready[b]) {
             usb_audio_pump();
+
+            // --- OLED update via DMA (zero CPU during transfer) ---
+            // Render + kick DMA during idle time. DMA feeds I2C TX FIFO
+            // in background — CPU is completely free for USB/DSP.
+            {
+                static absolute_time_t oled_next = {0};
+
+                if (!ssd1306_dma_busy() &&
+                    absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
+                    oled_prepare_frame();
+                    ssd1306_display_dma(OLED_I2C);
+                    oled_next = make_timeout_time_ms(200);  // ~5 fps
+                }
+            }
+
+            // Poll encoder + buttons + carrier state machine
+            encoder_poll();
+            button_poll();
+            carrier_poll();
+
+#if CFG_TUD_CDC
+            cdc_status_push();
+#endif
+
             tight_loop_contents();
         }
 
@@ -1755,6 +2509,7 @@ int main(void) {
             }
 
             float A = sqrtf(I2 * I2 + Q2 * Q2);
+
             float theta = atan2f(Q2, I2);
 
             float dtheta = theta - theta_prev;

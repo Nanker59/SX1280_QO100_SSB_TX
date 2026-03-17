@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SX1280 QO-100 SSB TX Control GUI
-================================
+=================================
 Modern, responsive GUI for controlling the SX1280 SDR transmitter.
 Supports all CDC commands and real-time parameter adjustment.
 
@@ -36,27 +36,23 @@ except ImportError:
 class TxConfig:
     """Mirrors the firmware's audio_cfg_t structure"""
     # RF
-    freq_hz: float = 2_400_400_000.0  # Now supports sub-Hz precision
+    freq_hz: float = 2_400_400_000.0
     ppm: float = 0.0
-    tx_power_dbm: int = 13  # Max TX power on SX1280 chip (-18 to +13 dBm)
+    tx_power_dbm: int = 13
     tx_enabled: bool = True
-    
     # Enables
     enable_bp: bool = True
     enable_eq: bool = True
     enable_comp: bool = True
-    
     # Bandpass
     bp_lo_hz: float = 50.0
     bp_hi_hz: float = 2700.0
-    bp_stages: int = 7  # 1-10, each stage = 12 dB/oct (7 = 84 dB/oct)
-    
+    bp_stages: int = 7
     # EQ (Shelving)
     eq_low_hz: float = 190.0
     eq_low_db: float = -2.0
     eq_high_hz: float = 1700.0
     eq_high_db: float = 13.5
-    
     # Compressor
     comp_thr_db: float = -2.5
     comp_ratio: float = 6.1
@@ -65,10 +61,10 @@ class TxConfig:
     comp_makeup_db: float = 0.0
     comp_knee_db: float = 16.5
     comp_out_limit: float = 0.940
-    
     # Power shaping
     amp_gain: float = 2.9
     amp_min_a: float = 0.000002
+
 
 # ============================================================
 # SERIAL BACKEND (CDC)
@@ -76,7 +72,7 @@ class TxConfig:
 
 class SerialWorker:
     """Thread-safe serial communication handler"""
-    
+
     def __init__(self, rx_queue: queue.Queue):
         self.rx_queue = rx_queue
         self.ser: Optional[serial.Serial] = None
@@ -148,22 +144,18 @@ class SerialWorker:
 # ============================================================
 
 def list_serial_ports():
-    """Get list of available serial ports"""
     if not HAS_SERIAL:
         return []
     ports = []
     for p in serial.tools.list_ports.comports():
-        # Prioritize SX1280 device
         if "SX1280" in p.description or "cafe:4073" in str(p.hwid).lower():
-            ports.insert(0, (p.device, f"★ {p.device} ({p.description})"))
+            ports.insert(0, (p.device, f"\u2605 {p.device} ({p.description})"))
         else:
             ports.append((p.device, f"{p.device} ({p.description})"))
     return ports
 
 
 class Debouncer:
-    """Debounce rapid function calls"""
-    
     def __init__(self, tk_root: tk.Tk, delay_ms: int, fn: Callable):
         self.root = tk_root
         self.delay_ms = delay_ms
@@ -189,46 +181,51 @@ class Debouncer:
 
 
 class LabeledScale(ttk.Frame):
-    """Reusable labeled scale widget with value display"""
-    
-    def __init__(self, parent, label: str, var: tk.Variable, 
-                 from_: float, to: float, resolution: float,
-                 on_change: Callable, format_str: str = "{:.1f}"):
+    """Reusable labeled scale widget with value display.
+
+    The value label auto-updates on any variable change (including
+    programmatic .set() calls from status push) via trace_add.
+    """
+
+    def __init__(self, parent, label, var, from_, to, resolution,
+                 on_change, format_str="{:.1f}"):
         super().__init__(parent)
-        
         self.var = var
         self.resolution = resolution
         self.on_change = on_change
         self.format_str = format_str
-        
+
         self.columnconfigure(1, weight=1)
-        
-        # Label
+
         ttk.Label(self, text=label, width=16, anchor="w").grid(row=0, column=0, sticky="w")
-        
-        # Scale
-        self.scale = ttk.Scale(self, from_=from_, to=to, orient=tk.HORIZONTAL, 
+
+        self.scale = ttk.Scale(self, from_=from_, to=to, orient=tk.HORIZONTAL,
                                variable=var, command=self._on_scale)
         self.scale.grid(row=0, column=1, sticky="ew", padx=(8, 8))
-        
-        # Value display
+
         self.value_label = ttk.Label(self, width=10, anchor="e")
         self.value_label.grid(row=0, column=2, sticky="e")
         self._update_value_label()
-        
-        # Bind for continuous updates
+
         self.scale.bind("<ButtonRelease-1>", self._on_release)
-        
+
+        # Auto-update label when variable changes (including programmatic .set())
+        self._trace_id = var.trace_add("write", self._on_var_write)
+
     def _on_scale(self, _val):
         self._update_value_label()
-        
+
+    def _on_var_write(self, *_args):
+        """Called on ANY variable change -- fixes TX Power label not updating."""
+        self._update_value_label()
+
     def _on_release(self, _event):
         v = float(self.var.get())
         v = round(v / self.resolution) * self.resolution
         self.var.set(v)
         self._update_value_label()
         self.on_change(v)
-        
+
     def _update_value_label(self):
         v = float(self.var.get())
         if callable(self.format_str):
@@ -239,78 +236,106 @@ class LabeledScale(ttk.Frame):
 
 
 # ============================================================
+# SCROLLABLE FRAME
+# ============================================================
+
+class ScrollableFrame(ttk.Frame):
+    """A frame with a vertical scrollbar for content that may exceed window height."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
+
+    def _on_inner_configure(self, _event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _bind_mousewheel(self, _event):
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, _event):
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+        self.canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event):
+        if event.num == 4:
+            self.canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(3, "units")
+        elif hasattr(event, 'delta'):
+            self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+
+# ============================================================
 # MAIN APPLICATION
 # ============================================================
 
 class SX1280ControlApp(ttk.Frame):
-    """Main application window"""
-    
-    # RF limits for QO-100 uplink
     FREQ_MIN_HZ = 2_400_000_000
     FREQ_MAX_HZ = 2_400_500_000
     FREQ_STEP_HZ = 100
 
-    def __init__(self, master: tk.Tk):
+    def __init__(self, master):
         super().__init__(master)
         self.master = master
-        
-        # State
+
         self.config = TxConfig()
-        self.rx_queue: queue.Queue = queue.Queue()
+        self.rx_queue = queue.Queue()
         self.worker = SerialWorker(self.rx_queue)
-        
-        # Debouncers (kept for other sliders, but freq/ppm are now immediate)
+        self._status_updating = False
+        self._heartbeat_id = None
+
         self.debounced_send = Debouncer(master, 150, self._send_cmd_safe)
         self.freq_debouncer = Debouncer(master, 200, self._send_freq)
-        
-        # Build UI
+
         self._create_variables()
         self._build_ui()
-        
-        # Initialize displays
         self._update_freq_display()
-        
-        # Global scroll binding for frequency tuning (works anywhere in window)
-        master.bind_all("<Button-4>", self._on_global_scroll)  # Linux scroll up
-        master.bind_all("<Button-5>", self._on_global_scroll)  # Linux scroll down
-        master.bind_all("<MouseWheel>", self._on_global_scroll)  # Windows/macOS
-        
+
         self._poll_rx()
-        
-        # Pack main frame
         self.pack(fill="both", expand=True)
 
+    # ----------------------------------------------------------
     def _create_variables(self):
-        """Create all Tk variables"""
-        # Connection
         self.port_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="⚫ Disconnected")
-        
-        # RF
+        self.status_var = tk.StringVar(value="\u26ab Disconnected")
         self.freq_mhz_var = tk.DoubleVar(value=self.config.freq_hz / 1_000_000)
-        self.freq_hz_var = tk.StringVar(value=str(self.config.freq_hz))
+        self.freq_khz_var = tk.StringVar(value=f"{self.config.freq_hz / 1000:.1f}")
         self.ppm_var = tk.DoubleVar(value=0.0)
         self.txpwr_var = tk.IntVar(value=self.config.tx_power_dbm)
         self.tx_enabled_var = tk.BooleanVar(value=True)
-        self.scroll_tune_enabled_var = tk.BooleanVar(value=False)  # Scroll tuning on/off
-        
-        # Enables
+        self.mode_var = tk.StringVar(value="usb")
+        self.tune_var = tk.BooleanVar(value=False)
         self.en_bp_var = tk.BooleanVar(value=self.config.enable_bp)
         self.en_eq_var = tk.BooleanVar(value=self.config.enable_eq)
         self.en_comp_var = tk.BooleanVar(value=self.config.enable_comp)
-        
-        # Bandpass
         self.bp_lo_var = tk.DoubleVar(value=self.config.bp_lo_hz)
         self.bp_hi_var = tk.DoubleVar(value=self.config.bp_hi_hz)
         self.bp_stages_var = tk.IntVar(value=self.config.bp_stages)
-        
-        # EQ
         self.eq_low_hz_var = tk.DoubleVar(value=self.config.eq_low_hz)
         self.eq_low_db_var = tk.DoubleVar(value=self.config.eq_low_db)
         self.eq_high_hz_var = tk.DoubleVar(value=self.config.eq_high_hz)
         self.eq_high_db_var = tk.DoubleVar(value=self.config.eq_high_db)
-        
-        # Compressor
         self.comp_thr_var = tk.DoubleVar(value=self.config.comp_thr_db)
         self.comp_ratio_var = tk.DoubleVar(value=self.config.comp_ratio)
         self.comp_att_var = tk.DoubleVar(value=self.config.comp_attack_ms)
@@ -318,182 +343,160 @@ class SX1280ControlApp(ttk.Frame):
         self.comp_makeup_var = tk.DoubleVar(value=self.config.comp_makeup_db)
         self.comp_knee_var = tk.DoubleVar(value=self.config.comp_knee_db)
         self.comp_outlim_var = tk.DoubleVar(value=self.config.comp_out_limit)
-        
-        # Power shaping
         self.amp_gain_var = tk.DoubleVar(value=self.config.amp_gain)
         self.amp_min_a_var = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
 
+    # ----------------------------------------------------------
     def _build_ui(self):
-        """Build the user interface"""
         self.master.title("SX1280 QO-100 SSB TX Control")
         self.master.geometry("900x800")
-        self.master.minsize(600, 500)
-        
-        # Configure grid weights for responsive layout
+        self.master.minsize(600, 400)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
-        
-        # === Connection Bar ===
+
         self._build_connection_bar()
-        
-        # === Main Content (Notebook) ===
+
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-        
-        # Tab 1: RF & DSP
+
         self._build_dsp_tab()
-        
-        # Tab 2: TX Control
-        self._build_tx_tab()
-        
-        # Tab 3: Console
         self._build_console_tab()
 
+    # ----------------------------------------------------------
     def _build_connection_bar(self):
-        """Build the connection toolbar"""
         conn_frame = ttk.Frame(self)
         conn_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         conn_frame.columnconfigure(1, weight=1)
-        
-        # Port selection
+
         ttk.Label(conn_frame, text="Port:").grid(row=0, column=0, padx=(0, 5))
-        
+
         ports = list_serial_ports()
         self.port_map = {label: dev for dev, label in ports}
         labels = list(self.port_map.keys()) or ["(no ports found)"]
         self.port_var.set(labels[0] if labels else "")
-        
-        self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var, 
+
+        self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var,
                                         values=labels, state="readonly", width=45)
         self.port_combo.grid(row=0, column=1, sticky="ew", padx=5)
-        
-        # Buttons
+
         btn_frame = ttk.Frame(conn_frame)
         btn_frame.grid(row=0, column=2)
-        
-        ttk.Button(btn_frame, text="🔄", width=3, command=self._refresh_ports).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="\U0001f504", width=3, command=self._refresh_ports).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="Connect", command=self._connect).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="Disconnect", command=self._disconnect).pack(side="left", padx=2)
-        
-        # Status
+
         ttk.Label(conn_frame, textvariable=self.status_var).grid(row=0, column=3, padx=(10, 0))
 
+    # ----------------------------------------------------------
     def _build_dsp_tab(self):
-        """Build the DSP control tab"""
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="RF & DSP")
-        
+        scroll_container = ScrollableFrame(self.notebook)
+        self.notebook.add(scroll_container, text="RF & DSP")
+        self._dsp_scroll = scroll_container
+        tab = scroll_container.inner
         tab.columnconfigure(0, weight=1)
-        
-        # === RF Section ===
-        rf_frame = ttk.LabelFrame(tab, text="RF / Frequency", padding=10)
-        rf_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        rf_frame.columnconfigure(1, weight=1)
-        
-        # Bind scroll to entire RF frame
-        rf_frame.bind("<MouseWheel>", self._on_freq_scroll)
-        rf_frame.bind("<Button-4>", self._on_freq_scroll)
-        rf_frame.bind("<Button-5>", self._on_freq_scroll)
-        
-        # === TX ON/OFF Button (prominent, with color) ===
-        tx_btn_frame = ttk.Frame(rf_frame)
-        tx_btn_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        
-        # Use regular tk.Button for color support
-        self.tx_button = tk.Button(tx_btn_frame, text="TX OFF", width=12, font=("TkDefaultFont", 11, "bold"),
+
+        # === Mode / Tune ===
+        mt_frame = ttk.LabelFrame(tab, text="Mode / Tune", padding=10)
+        mt_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        mt_inner = ttk.Frame(mt_frame)
+        mt_inner.pack(fill="x")
+
+        ttk.Label(mt_inner, text="Mode:").pack(side="left", padx=(0, 5))
+        ttk.Radiobutton(mt_inner, text="USB (SSB)", variable=self.mode_var,
+                         value="usb", command=self._on_mode_change).pack(side="left", padx=5)
+        ttk.Radiobutton(mt_inner, text="CW", variable=self.mode_var,
+                         value="cw", command=self._on_mode_change).pack(side="left", padx=5)
+
+        ttk.Separator(mt_inner, orient="vertical").pack(side="left", fill="y", padx=15, pady=2)
+
+        self.tune_button = tk.Button(mt_inner, text="TUNE OFF", width=12,
+                                      font=("TkDefaultFont", 10, "bold"),
+                                      command=self._toggle_tune, relief="raised", bd=3,
+                                      bg="#cccccc", fg="black")
+        self.tune_button.pack(side="left", padx=5)
+
+        ttk.Separator(mt_inner, orient="vertical").pack(side="left", fill="y", padx=15, pady=2)
+
+        self.tx_button = tk.Button(mt_inner, text="TX OFF", width=10,
+                                    font=("TkDefaultFont", 10, "bold"),
                                     command=self._toggle_tx, relief="raised", bd=3)
         self.tx_button.pack(side="left", padx=5)
         self._update_tx_button()
-        
-        # Scroll tuning toggle
-        self.scroll_tune_cb = ttk.Checkbutton(tx_btn_frame, text="🖱️ Scroll Tune (50 Hz/step)", 
-                                               variable=self.scroll_tune_enabled_var)
-        self.scroll_tune_cb.pack(side="left", padx=20)
-        
-        # Frequency slider
+
+        # === RF / Frequency ===
+        rf_frame = ttk.LabelFrame(tab, text="RF / Frequency", padding=10)
+        rf_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        rf_frame.columnconfigure(1, weight=1)
+
         ttk.Label(rf_frame, text="Frequency:").grid(row=1, column=0, sticky="w")
-        
         freq_slider_frame = ttk.Frame(rf_frame)
         freq_slider_frame.grid(row=1, column=1, sticky="ew", padx=5)
         freq_slider_frame.columnconfigure(0, weight=1)
-        
-        self.freq_scale = ttk.Scale(freq_slider_frame, 
+
+        self.freq_scale = ttk.Scale(freq_slider_frame,
                                      from_=self.FREQ_MIN_HZ / 1_000_000,
                                      to=self.FREQ_MAX_HZ / 1_000_000,
                                      orient=tk.HORIZONTAL,
                                      variable=self.freq_mhz_var,
                                      command=self._on_freq_slider)
         self.freq_scale.grid(row=0, column=0, sticky="ew")
-        
-        # Frequency entry
+
         freq_entry_frame = ttk.Frame(rf_frame)
         freq_entry_frame.grid(row=1, column=2)
-        
-        self.freq_entry = ttk.Entry(freq_entry_frame, textvariable=self.freq_hz_var, width=14)
+        self.freq_entry = ttk.Entry(freq_entry_frame, textvariable=self.freq_khz_var, width=14)
         self.freq_entry.pack(side="left")
         self.freq_entry.bind("<Return>", lambda e: self._send_freq_from_entry())
-        self.freq_entry.bind("<MouseWheel>", self._on_freq_scroll)
-        self.freq_entry.bind("<Button-4>", self._on_freq_scroll)
-        self.freq_entry.bind("<Button-5>", self._on_freq_scroll)
-        ttk.Label(freq_entry_frame, text=" Hz").pack(side="left")
-        
-        # Frequency display frame (uplink + downlink)
+        ttk.Label(freq_entry_frame, text=" kHz").pack(side="left")
+
         freq_display_frame = ttk.Frame(rf_frame)
         freq_display_frame.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
-        
-        # Uplink MHz display
-        self.freq_mhz_label = ttk.Label(freq_display_frame, text="2400.1000 MHz ↑", 
+
+        self.freq_mhz_label = ttk.Label(freq_display_frame, text="2400.1000 MHz \u2191",
                                          font=("TkDefaultFont", 12, "bold"))
         self.freq_mhz_label.pack(side="left")
-        self.freq_mhz_label.bind("<MouseWheel>", self._on_freq_scroll)
-        self.freq_mhz_label.bind("<Button-4>", self._on_freq_scroll)
-        self.freq_mhz_label.bind("<Button-5>", self._on_freq_scroll)
-        
-        # Downlink display (QO-100: uplink 2400.xxx -> downlink 10489.xxx)
-        ttk.Label(freq_display_frame, text="   →   ").pack(side="left")
-        self.downlink_label = ttk.Label(freq_display_frame, text="10489.6000 MHz ↓", 
+
+        ttk.Label(freq_display_frame, text="   \u2192   ").pack(side="left")
+        self.downlink_label = ttk.Label(freq_display_frame, text="10489.6000 MHz \u2193",
                                          font=("TkDefaultFont", 12, "bold"), foreground="blue")
         self.downlink_label.pack(side="left")
-        
-        # PPM slider (fine adjustment -2 to +2 ppm) - IMMEDIATE response
+
+        # PPM
         ttk.Label(rf_frame, text="PPM:").grid(row=3, column=0, sticky="w", pady=(10, 0))
         ppm_frame = ttk.Frame(rf_frame)
         ppm_frame.grid(row=3, column=1, columnspan=2, sticky="ew", padx=5, pady=(10, 0))
         ppm_frame.columnconfigure(0, weight=1)
-        
+
         self.ppm_scale = ttk.Scale(ppm_frame, from_=-2.0, to=2.0, orient=tk.HORIZONTAL,
                                     variable=self.ppm_var, command=self._on_ppm_slider)
         self.ppm_scale.grid(row=0, column=0, sticky="ew")
-        
         self.ppm_label = ttk.Label(ppm_frame, text="0.000 ppm", width=12)
         self.ppm_label.grid(row=0, column=1, padx=5)
-        
-        # TX Power - IMMEDIATE response
+
+        # TX Power
         ttk.Label(rf_frame, text="TX Power:").grid(row=4, column=0, sticky="w", pady=(10, 0))
         txpwr_frame = ttk.Frame(rf_frame)
         txpwr_frame.grid(row=4, column=1, sticky="ew", padx=5, pady=(10, 0))
         txpwr_frame.columnconfigure(0, weight=1)
-        
-        LabeledScale(txpwr_frame, "", self.txpwr_var, -18, 13, 1,
+
+        self.txpwr_scale = LabeledScale(txpwr_frame, "", self.txpwr_var, -18, 13, 1,
                      lambda v: self._send_cmd_safe(f"txpwr {int(v)}"),
-                     lambda v: f"{int(v)} dBm").pack(fill="x")
-        
-        # === Enable Checkboxes ===
+                     lambda v: f"{int(v)} dBm")
+        self.txpwr_scale.pack(fill="x")
+
+        # === DSP Modules ===
         enable_frame = ttk.LabelFrame(tab, text="DSP Modules", padding=10)
-        enable_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        
+        enable_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         ttk.Checkbutton(enable_frame, text="Bandpass Filter", variable=self.en_bp_var,
                         command=lambda: self._send_enable("bp", self.en_bp_var.get())).pack(side="left", padx=20)
         ttk.Checkbutton(enable_frame, text="Equalizer", variable=self.en_eq_var,
                         command=lambda: self._send_enable("eq", self.en_eq_var.get())).pack(side="left", padx=20)
         ttk.Checkbutton(enable_frame, text="Compressor", variable=self.en_comp_var,
                         command=lambda: self._send_enable("comp", self.en_comp_var.get())).pack(side="left", padx=20)
-        
+
         # === Bandpass ===
         bp_frame = ttk.LabelFrame(tab, text="Bandpass Filter", padding=10)
-        bp_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        bp_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         bp_frame.columnconfigure(0, weight=1)
-        
         LabeledScale(bp_frame, "Low cutoff (Hz)", self.bp_lo_var, 50, 1500, 10,
                      lambda v: self.debounced_send.call(f"set bp_lo {v:.0f}"),
                      "{:.0f}").pack(fill="x")
@@ -503,12 +506,11 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(bp_frame, "Steepness (stages)", self.bp_stages_var, 1, 10, 1,
                      lambda v: self.debounced_send.call(f"set bp_stages {int(v)}"),
                      lambda v: f"{int(v)} ({int(v)*12} dB/oct)").pack(fill="x")
-        
+
         # === EQ ===
         eq_frame = ttk.LabelFrame(tab, text="Equalizer (Shelving)", padding=10)
-        eq_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        eq_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         eq_frame.columnconfigure(0, weight=1)
-        
         LabeledScale(eq_frame, "Low shelf freq (Hz)", self.eq_low_hz_var, 50, 1000, 10,
                      lambda v: self.debounced_send.call(f"set eq_low_hz {v:.0f}"),
                      "{:.0f}").pack(fill="x")
@@ -521,12 +523,11 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(eq_frame, "High shelf gain (dB)", self.eq_high_db_var, -24, 24, 0.5,
                      lambda v: self.debounced_send.call(f"set eq_high_db {v:.1f}"),
                      "{:.1f}").pack(fill="x")
-        
+
         # === Compressor ===
         comp_frame = ttk.LabelFrame(tab, text="Compressor", padding=10)
-        comp_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        comp_frame.grid(row=5, column=0, sticky="ew", pady=(0, 10))
         comp_frame.columnconfigure(0, weight=1)
-        
         LabeledScale(comp_frame, "Threshold (dB)", self.comp_thr_var, -60, 0, 0.5,
                      lambda v: self.debounced_send.call(f"set comp_thr {v:.1f}"),
                      "{:.1f}").pack(fill="x")
@@ -548,117 +549,64 @@ class SX1280ControlApp(ttk.Frame):
         LabeledScale(comp_frame, "Output limit", self.comp_outlim_var, 0.01, 0.999, 0.001,
                      lambda v: self.debounced_send.call(f"set comp_outlim {v:.3f}"),
                      "{:.3f}").pack(fill="x")
-        
+
         # === Power Shaping ===
         pwr_frame = ttk.LabelFrame(tab, text="Power Shaping", padding=10)
-        pwr_frame.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        pwr_frame.grid(row=6, column=0, sticky="ew", pady=(0, 10))
         pwr_frame.columnconfigure(0, weight=1)
-        
         LabeledScale(pwr_frame, "Amp gain", self.amp_gain_var, 0.01, 5.0, 0.01,
                      lambda v: self.debounced_send.call(f"set amp_gain {v:.3f}"),
                      "{:.3f}").pack(fill="x")
-        
         amp_min_frame = ttk.Frame(pwr_frame)
         amp_min_frame.pack(fill="x", pady=(5, 0))
         ttk.Label(amp_min_frame, text="Amp min A:", width=16).pack(side="left")
         ttk.Entry(amp_min_frame, textvariable=self.amp_min_a_var, width=16).pack(side="left", padx=5)
-        ttk.Button(amp_min_frame, text="Set", 
+        ttk.Button(amp_min_frame, text="Set",
                    command=lambda: self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
                   ).pack(side="left")
 
-    def _build_tx_tab(self):
-        """Build the TX control tab"""
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="TX Control")
-        
-        tab.columnconfigure(0, weight=1)
-        
-        # === CW Test ===
-        cw_frame = ttk.LabelFrame(tab, text="CW Test Mode", padding=20)
-        cw_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        
-        ttk.Label(cw_frame, text="Transmit continuous carrier for testing:").pack(anchor="w")
-        
-        btn_frame = ttk.Frame(cw_frame)
-        btn_frame.pack(pady=10)
-        
-        self.cw_btn = ttk.Button(btn_frame, text="▶ Start CW", command=self._start_cw, width=15)
-        self.cw_btn.pack(side="left", padx=10)
-        
-        self.stop_btn = ttk.Button(btn_frame, text="⏹ Stop", command=self._stop_cw, width=15)
-        self.stop_btn.pack(side="left", padx=10)
-        
-        # === Quick Commands ===
-        cmd_frame = ttk.LabelFrame(tab, text="Quick Commands", padding=20)
-        cmd_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        
-        quick_btns = ttk.Frame(cmd_frame)
-        quick_btns.pack()
-        
-        ttk.Button(quick_btns, text="GET Config", command=lambda: self._send_cmd_safe("get"), 
-                   width=15).pack(side="left", padx=5)
-        ttk.Button(quick_btns, text="DIAG", command=lambda: self._send_cmd_safe("diag"),
-                   width=15).pack(side="left", padx=5)
-        ttk.Button(quick_btns, text="HELP", command=lambda: self._send_cmd_safe("help"),
-                   width=15).pack(side="left", padx=5)
-        
-        # === Manual Command ===
-        manual_frame = ttk.LabelFrame(tab, text="Manual Command", padding=10)
-        manual_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        manual_frame.columnconfigure(0, weight=1)
-        
-        self.manual_cmd_var = tk.StringVar()
-        cmd_entry = ttk.Entry(manual_frame, textvariable=self.manual_cmd_var)
-        cmd_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        cmd_entry.bind("<Return>", lambda e: self._send_manual_cmd())
-        
-        ttk.Button(manual_frame, text="Send", command=self._send_manual_cmd).grid(row=0, column=1)
-        
-        # === Status Info ===
-        info_frame = ttk.LabelFrame(tab, text="Device Info", padding=10)
-        info_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
-        tab.rowconfigure(3, weight=1)
-        
-        self.info_text = tk.Text(info_frame, height=10, wrap="word", state="disabled",
-                                  bg="#f5f5f5", font=("Consolas", 10))
-        self.info_text.pack(fill="both", expand=True)
-
+    # ----------------------------------------------------------
     def _build_console_tab(self):
-        """Build the console/log tab"""
         tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="Console")
-        
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        
-        # Log text
+
         log_frame = ttk.Frame(tab)
         log_frame.grid(row=0, column=0, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        
+
         self.log_text = tk.Text(log_frame, wrap="word", font=("Consolas", 9))
         self.log_text.grid(row=0, column=0, sticky="nsew")
-        
+
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log_text.config(yscrollcommand=scrollbar.set)
-        
-        # Tag for different message types
+
         self.log_text.tag_configure("sent", foreground="#0066cc")
         self.log_text.tag_configure("recv", foreground="#006600")
         self.log_text.tag_configure("error", foreground="#cc0000")
         self.log_text.tag_configure("info", foreground="#666666")
-        
-        # Buttons
+
+        # Manual command (below the log)
+        cmd_frame = ttk.LabelFrame(tab, text="Command", padding=5)
+        cmd_frame.grid(row=1, column=0, sticky="ew", pady=(5, 5))
+        cmd_frame.columnconfigure(0, weight=1)
+
+        self.manual_cmd_var = tk.StringVar()
+        cmd_entry = ttk.Entry(cmd_frame, textvariable=self.manual_cmd_var)
+        cmd_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        cmd_entry.bind("<Return>", lambda e: self._send_manual_cmd())
+        ttk.Button(cmd_frame, text="Send", command=self._send_manual_cmd).grid(row=0, column=1)
+
         btn_frame = ttk.Frame(tab)
-        btn_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        
+        btn_frame.grid(row=2, column=0, sticky="ew", pady=(5, 0))
         ttk.Button(btn_frame, text="Clear Log", command=self._clear_log).pack(side="left")
         ttk.Button(btn_frame, text="Send All Settings", command=self._send_all).pack(side="right")
 
     # === Connection Methods ===
-    
+
     def _refresh_ports(self):
         ports = list_serial_ports()
         self.port_map = {label: dev for dev, label in ports}
@@ -670,34 +618,47 @@ class SX1280ControlApp(ttk.Frame):
 
     def _connect(self):
         if not HAS_SERIAL:
-            messagebox.showerror("Missing dependency", 
+            messagebox.showerror("Missing dependency",
                                 "pyserial is required.\nInstall with: pip install pyserial")
             return
-        
         label = self.port_var.get()
         port = self.port_map.get(label)
         if not port or "no ports" in label.lower():
             messagebox.showerror("No port", "No serial port selected.")
             return
-        
         try:
             self.worker.connect(port)
-            self.status_var.set(f"🟢 Connected: {port}")
+            self.status_var.set(f"\U0001f7e2 Connected: {port}")
             self._log(f"Connected to {port}", "info")
-            # Request current config
             self.master.after(500, lambda: self._send_cmd_safe("get"))
+            self.master.after(800, lambda: self._send_cmd_safe("status"))
+            self._start_heartbeat()
         except Exception as e:
             messagebox.showerror("Connection failed", str(e))
-            self.status_var.set("🔴 Connection failed")
+            self.status_var.set("\U0001f534 Connection failed")
 
     def _disconnect(self):
+        if self._heartbeat_id is not None:
+            self.master.after_cancel(self._heartbeat_id)
+            self._heartbeat_id = None
         self.worker.disconnect()
-        self.status_var.set("⚫ Disconnected")
+        self.status_var.set("\u26ab Disconnected")
         self._log("Disconnected", "info")
 
+    def _start_heartbeat(self):
+        """Periodically request status from firmware to keep GUI in sync."""
+        if not self.worker.is_connected():
+            self._heartbeat_id = None
+            return
+        try:
+            self.worker.send_line("status")
+        except Exception:
+            pass
+        self._heartbeat_id = self.master.after(2000, self._start_heartbeat)
+
     # === Command Methods ===
-    
-    def _send_cmd_safe(self, cmd: str):
+
+    def _send_cmd_safe(self, cmd):
         try:
             if not self.worker.is_connected():
                 self._log(f"[NOT CONNECTED] {cmd}", "error")
@@ -707,142 +668,94 @@ class SX1280ControlApp(ttk.Frame):
         except Exception as e:
             self._log(f"[SEND ERROR] {e}", "error")
 
-    def _send_enable(self, which: str, enabled: bool):
+    def _send_enable(self, which, enabled):
         v = "1" if enabled else "0"
         self._send_cmd_safe(f"enable {which} {v}")
 
     def _toggle_tx(self):
-        """Toggle TX on/off"""
         current = self.tx_enabled_var.get()
         new_state = not current
         self.tx_enabled_var.set(new_state)
         self._update_tx_button()
         self._send_cmd_safe(f"tx {'1' if new_state else '0'}")
 
+    def _on_mode_change(self):
+        if self._status_updating:
+            return
+        mode = self.mode_var.get()
+        self._send_cmd_safe(f"mode {mode}")
+
+    def _toggle_tune(self):
+        new_state = not self.tune_var.get()
+        self.tune_var.set(new_state)
+        self._update_tune_button()
+        self._send_cmd_safe(f"tune {'1' if new_state else '0'}")
+
+    def _update_tune_button(self):
+        if self.tune_var.get():
+            self.tune_button.config(text="TUNE ON", bg="#ff8800", fg="white",
+                                     activebackground="#ffaa00", activeforeground="white")
+        else:
+            self.tune_button.config(text="TUNE OFF", bg="#cccccc", fg="black",
+                                     activebackground="#dddddd", activeforeground="black")
+
     def _update_tx_button(self):
-        """Update TX button appearance based on state"""
         if self.tx_enabled_var.get():
-            self.tx_button.config(text="TX ON", bg="#00cc00", fg="white", 
+            self.tx_button.config(text="TX ON", bg="#00cc00", fg="white",
                                    activebackground="#00ff00", activeforeground="white")
         else:
             self.tx_button.config(text="TX OFF", bg="#cccccc", fg="black",
                                    activebackground="#dddddd", activeforeground="black")
 
     def _on_ppm_slider(self, _val):
-        """Handle PPM slider change - IMMEDIATE response"""
+        if self._status_updating:
+            return
         ppm = self.ppm_var.get()
         self.ppm_label.config(text=f"{ppm:.3f} ppm")
         self._update_freq_display()
-        # Send immediately without debounce
         self._send_cmd_safe(f"ppm {ppm:.4f}")
 
     def _update_freq_display(self):
-        """Update frequency displays (uplink + downlink)"""
         try:
-            hz = float(self.freq_hz_var.get())
+            khz = float(self.freq_khz_var.get())
+            hz = khz * 1000
         except ValueError:
             hz = self.config.freq_hz
-        
-        # Uplink display
-        self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz ↑")
-        
-        # QO-100 downlink: uplink 2400.xxx MHz -> downlink 10489.xxx MHz
-        # Offset = 10489.5 - 2400.0 = 8089.5 MHz
+        self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz \u2191")
         downlink_hz = hz + 8089_500_000
-        self.downlink_label.config(text=f"{downlink_hz/1_000_000:.4f} MHz ↓")
-
-    def _on_global_scroll(self, event):
-        """Global scroll handler - tune frequency if scroll tune is enabled"""
-        if not self.scroll_tune_enabled_var.get():
-            return  # Let event propagate normally
-        
-        # Check if we're on the first tab (RF & DSP)
-        try:
-            current_tab = self.notebook.index(self.notebook.select())
-            if current_tab != 0:
-                return  # Only tune on RF tab
-        except:
-            return
-        
-        # Call the frequency scroll handler
-        return self._on_freq_scroll(event)
-
-    def _on_freq_scroll(self, event):
-        """Handle mouse scroll for frequency tuning (50 Hz per step)"""
-        if not self.scroll_tune_enabled_var.get():
-            return  # Scroll tuning disabled
-        
-        # Determine scroll direction
-        if event.num == 4:
-            delta = 50  # Linux scroll up
-        elif event.num == 5:
-            delta = -50  # Linux scroll down
-        elif hasattr(event, 'delta'):
-            # Windows/macOS: delta is typically ±120
-            delta = 50 if event.delta > 0 else -50
-        else:
-            return
-        
-        # Get current freq and adjust
-        try:
-            current_hz = float(self.freq_hz_var.get())
-        except ValueError:
-            current_hz = self.config.freq_hz
-        
-        new_hz = current_hz + delta
-        new_hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, new_hz))
-        
-        # Update all displays
-        self.freq_hz_var.set(f"{new_hz:.0f}")
-        self.freq_mhz_var.set(new_hz / 1_000_000)
-        self._update_freq_display()
-        
-        # Send immediately
-        self._send_cmd_safe(f"freq {new_hz:.1f}")
-        
-        # Prevent event propagation
-        return "break"
+        self.downlink_label.config(text=f"{downlink_hz/1_000_000:.4f} MHz \u2193")
 
     def _on_freq_slider(self, _val):
-        """Handle frequency slider - IMMEDIATE response"""
+        if self._status_updating:
+            return
         mhz = self.freq_mhz_var.get()
-        hz = int(round(mhz * 1_000_000))
+        hz = round(mhz * 1_000_000 / 100) * 100  # snap to 0.1 kHz
         hz = self._clamp_freq(hz)
-        self.freq_hz_var.set(str(hz))
+        self.freq_khz_var.set(f"{hz / 1000:.1f}")
         self._update_freq_display()
-        # Send immediately
         self._send_cmd_safe(f"freq {hz}")
 
-    def _clamp_freq(self, hz) -> float:
-        """Clamp frequency to valid range (now supports float)"""
-        hz = max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
-        return hz
+    def _clamp_freq(self, hz):
+        return max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
 
     def _send_freq(self, hz):
-        """Send frequency command (supports sub-Hz precision)"""
         self._send_cmd_safe(f"freq {hz:.1f}")
 
     def _send_freq_from_entry(self):
         try:
-            hz = float(self.freq_hz_var.get().replace(",", "."))
+            khz = float(self.freq_khz_var.get().replace(",", "."))
+            hz = round(khz * 1000 / 100) * 100  # snap to 0.1 kHz
             hz = self._clamp_freq(hz)
-            self.freq_hz_var.set(f"{hz:.0f}")
+            self.freq_khz_var.set(f"{hz / 1000:.1f}")
             self.freq_mhz_var.set(hz / 1_000_000)
             self._update_freq_display()
             self._send_cmd_safe(f"freq {hz:.1f}")
         except ValueError:
-            messagebox.showerror("Invalid frequency", "Frequency must be a number in Hz")
+            messagebox.showerror("Invalid frequency", "Frequency must be a number in kHz")
 
     def _send_ppm(self):
-        """Send PPM from slider (now handled by _on_ppm_slider)"""
         ppm = self.ppm_var.get()
         self._send_cmd_safe(f"ppm {ppm:.4f}")
-
-    def _start_cw(self):
-        self._send_cmd_safe("cw")
-
-    def _stop_cw(self):
-        self._send_cmd_safe("stop")
 
     def _send_manual_cmd(self):
         cmd = self.manual_cmd_var.get().strip()
@@ -851,38 +764,29 @@ class SX1280ControlApp(ttk.Frame):
             self.manual_cmd_var.set("")
 
     def _send_all(self):
-        """Send all current settings to the device"""
-        # RF
-        hz = self._clamp_freq(int(self.freq_hz_var.get()))
-        self._send_cmd_safe(f"freq {hz}")
-        
         try:
-            ppm = float(self.ppm_var.get().replace(",", "."))
+            khz = float(self.freq_khz_var.get())
+            hz = self._clamp_freq(int(round(khz * 1000)))
+        except ValueError:
+            hz = int(self.config.freq_hz)
+        self._send_cmd_safe(f"freq {hz}")
+        try:
+            ppm = float(self.ppm_var.get())
             if -100 <= ppm <= 100:
                 self._send_cmd_safe(f"ppm {ppm}")
-        except:
+        except Exception:
             pass
-        
-        # TX Power
         self._send_cmd_safe(f"txpwr {int(self.txpwr_var.get())}")
-        
-        # Enables
         self._send_cmd_safe(f"enable bp {'1' if self.en_bp_var.get() else '0'}")
         self._send_cmd_safe(f"enable eq {'1' if self.en_eq_var.get() else '0'}")
         self._send_cmd_safe(f"enable comp {'1' if self.en_comp_var.get() else '0'}")
-        
-        # Bandpass
         self._send_cmd_safe(f"set bp_lo {self.bp_lo_var.get():.0f}")
         self._send_cmd_safe(f"set bp_hi {self.bp_hi_var.get():.0f}")
         self._send_cmd_safe(f"set bp_stages {int(self.bp_stages_var.get())}")
-        
-        # EQ
         self._send_cmd_safe(f"set eq_low_hz {self.eq_low_hz_var.get():.0f}")
         self._send_cmd_safe(f"set eq_low_db {self.eq_low_db_var.get():.1f}")
         self._send_cmd_safe(f"set eq_high_hz {self.eq_high_hz_var.get():.0f}")
         self._send_cmd_safe(f"set eq_high_db {self.eq_high_db_var.get():.1f}")
-        
-        # Compressor
         self._send_cmd_safe(f"set comp_thr {self.comp_thr_var.get():.1f}")
         self._send_cmd_safe(f"set comp_ratio {self.comp_ratio_var.get():.1f}")
         self._send_cmd_safe(f"set comp_att {self.comp_att_var.get():.1f}")
@@ -890,68 +794,123 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"set comp_makeup {self.comp_makeup_var.get():.1f}")
         self._send_cmd_safe(f"set comp_knee {self.comp_knee_var.get():.1f}")
         self._send_cmd_safe(f"set comp_outlim {self.comp_outlim_var.get():.3f}")
-        
-        # Power shaping
         self._send_cmd_safe(f"set amp_gain {self.amp_gain_var.get():.3f}")
         self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
-        
         self._log("All settings sent", "info")
 
     # === Logging ===
-    
-    def _log(self, msg: str, tag: str = "recv"):
+
+    def _log(self, msg, tag="recv"):
         self.log_text.insert("end", msg + "\n", tag)
         self.log_text.see("end")
-        
-        # Also update info text for certain responses
-        if "CFG:" in msg or "===" in msg or "Status:" in msg:
-            self.info_text.config(state="normal")
-            self.info_text.insert("end", msg + "\n")
-            self.info_text.see("end")
-            self.info_text.config(state="disabled")
 
     def _clear_log(self):
         self.log_text.delete("1.0", "end")
-        self.info_text.config(state="normal")
-        self.info_text.delete("1.0", "end")
-        self.info_text.config(state="disabled")
 
     def _poll_rx(self):
-        """Poll for received serial data"""
+        processed = 0
+        max_per_cycle = 20
+        latest_status = None
         try:
-            while True:
+            while processed < max_per_cycle:
                 line = self.rx_queue.get_nowait()
-                self._log(line, "recv")
+                processed += 1
+                if line.startswith("!S "):
+                    latest_status = line  # keep only the newest status
+                else:
+                    self._log(line, "recv")
         except queue.Empty:
             pass
-        self.master.after(50, self._poll_rx)
+        if latest_status is not None:
+            self._handle_status_push(latest_status)
+        # Poll faster when queue had items, slower when idle
+        delay = 10 if processed >= max_per_cycle else 50
+        self.master.after(delay, self._poll_rx)
+
+    def _handle_status_push(self, line):
+        """Parse firmware status push and update GUI widgets.
+
+        Format: '!S mode=1 tune=0 tx=1 pwr=13 ppm=0.12 freq=2400100000.0'
+
+        Fixes:
+        - TX Power label: LabeledScale trace_add auto-updates on .set()
+        - Frequency: formatted as integer string, slider guarded with _status_updating
+        """
+        try:
+            parts = line.strip().split()
+            kv = {}
+            for p in parts[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    kv[k] = v
+
+            self._status_updating = True
+
+            if "mode" in kv:
+                new_mode = "cw" if kv["mode"] == "1" else "usb"
+                if self.mode_var.get() != new_mode:
+                    self.mode_var.set(new_mode)
+
+            if "tune" in kv:
+                new_tune = kv["tune"] == "1"
+                if self.tune_var.get() != new_tune:
+                    self.tune_var.set(new_tune)
+                    self._update_tune_button()
+
+            if "tx" in kv:
+                new_tx = kv["tx"] == "1"
+                if self.tx_enabled_var.get() != new_tx:
+                    self.tx_enabled_var.set(new_tx)
+                    self._update_tx_button()
+
+            if "pwr" in kv:
+                new_pwr = int(kv["pwr"])
+                if self.txpwr_var.get() != new_pwr:
+                    self.txpwr_var.set(new_pwr)
+                    # LabeledScale trace auto-updates the value label
+
+            if "ppm" in kv:
+                new_ppm = float(kv["ppm"])
+                if abs(self.ppm_var.get() - new_ppm) > 0.0001:
+                    self.ppm_var.set(new_ppm)
+                    self.ppm_label.config(text=f"{new_ppm:.3f} ppm")
+
+            if "freq" in kv:
+                new_freq = float(kv["freq"])
+                if abs(self.config.freq_hz - new_freq) > 0.5:
+                    self.config.freq_hz = new_freq
+                    self.freq_mhz_var.set(new_freq / 1_000_000)
+                    self.freq_khz_var.set(f"{new_freq / 1000:.1f}")
+                    self._update_freq_display()
+
+            self._status_updating = False
+        except Exception as e:
+            self._status_updating = False
+            self._log(f"[STATUS PARSE ERROR] {e}: {line!r}", "error")
 
 
 # ============================================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================================
 
 def main():
     root = tk.Tk()
-    
-    # Try to use a modern theme
+
     style = ttk.Style(root)
     available_themes = style.theme_names()
     for theme in ["clam", "alt", "default"]:
         if theme in available_themes:
             style.theme_use(theme)
             break
-    
-    # Custom styles
+
     style.configure("TLabelframe.Label", font=("TkDefaultFont", 10, "bold"))
-    
+
     app = SX1280ControlApp(root)
-    
-    # Clean shutdown
+
     def on_close():
         app.worker.disconnect()
         root.destroy()
-    
+
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 

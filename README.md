@@ -1,6 +1,6 @@
 # SX1280 QO-100 SSB TX
 
-**Experimental SSB/Digital transmitter for QO-100 satellite based on SX1280 module (2.4 GHz)**
+**SSB/CW transmitter for QO-100 satellite (Es'hail 2) with SX1280 + Raspberry Pi Pico 2**
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
@@ -13,22 +13,27 @@
 
 ## Project Description
 
-SSB (Single Sideband) and digital modes transmitter for the 2.4 GHz band, designed for communication via the narrowband transponder of the geostationary satellite **QO-100 (Es'hail 2)**.
+SSB (Single Sideband) and CW transmitter for the 2.4 GHz band, designed for communication via the narrowband transponder of the geostationary satellite **QO-100 (Es'hail 2)**.
+
+The system uses a **dual-core architecture** — Core0 handles USB audio input and real-time DSP processing, while Core1 handles Hilbert transform, I/Q modulation and SX1280 SPI transmission at 8 kHz rate.
 
 ### Features
 
-- **USB Audio** - Pico acts as USB sound card, audio input directly from computer
-- **Output power up to +27 dBm** - Built-in PA in LoRa1280F27 module
-- **Real-time DSP** - Bandpass filter, equalizer, compressor
-- **USB CDC configuration** - Serial port for parameter control
-- **PPM correction** - Precise frequency tuning
-- **Carrier mode** - Automatic CW when USB disconnected (after 10s)
+- **USB Audio** — Pico acts as USB sound card, audio input directly from computer
+- **Real-time DSP** — Bandpass filter, equalizer, compressor, power shaping
+- **Sub-Hz frequency precision** — Automatic PLL + DSP fine tuning (no 198 Hz quantization)
+- **OLED display (SSD1306)** — Real-time status: frequency, mode, TX state, parameters
+- **Rotary encoder + buttons** — Standalone operation without computer
+- **CW keying** — Iambic-style keying with PTT/KEY button
+- **Python GUI** — Full control panel over CDC serial with live synchronization
+- **Output power up to +27 dBm** — Built-in PA in LoRa1280F27 module
+- **PPM correction** — Precise frequency calibration
 
 ## Author
 
 **Kacper Kidała SP8ESA**
 
-Code generated with assistance from **Claude Opus 4.5** and **GPT 5.2**.
+Code generated with assistance from **Claude Opus 4** and **GPT 5.2**.
 
 ## Hardware
 
@@ -36,17 +41,42 @@ Code generated with assistance from **Claude Opus 4.5** and **GPT 5.2**.
 
 | Component | Description |
 |-----------|-------------|
-| Raspberry Pi Pico 2 | RP2350 microcontroller |
+| Raspberry Pi Pico 2 | RP2350 microcontroller (dual Cortex-M33) |
 | LoRa1280F27-TCXO | SX1280 module with PA (+27 dBm) and TCXO |
+| SSD1306 OLED 128×64 | I2C display (0.96") |
+| Rotary encoder with push button | KY-040 or similar (3-pin + SW) |
+| PTT / CW key button | Momentary pushbutton (normally open) |
 | 2.4 GHz Antenna | SMA or u.FL connector |
 
 ### Prototype
 
 ![Prototype transmitter](img/prototype.png)
+*Prototype transmitter used for QO-100 tests — quick and dirty but it works!*
 
-*Prototype transmitter used for QO-100 tests - quick and dirty but it works!*
+### OLED Display
+
+![OLED display](img/disp.jpg)
+*SSD1306 OLED showing frequency, mode, TX state and current parameter*
+
+## Architecture
+
+```
+Core0 (USB + DSP Producer)            Core1 (Radio Consumer)
+┌──────────────────────────┐          ┌──────────────────────────┐
+│ USB Audio @ 48kHz        │          │ Timer IRQ @ 8kHz         │
+│ Downsample 48k → 8k     │          │ Read from block buffer   │
+│ DSP: BP → EQ → Comp     │ ───────► │ Hilbert transform        │
+│ Write to block buffer    │          │ I/Q modulation           │
+│ Encoder / button poll    │          │ SX1280 SPI TX            │
+│ OLED refresh via DMA     │          │                          │
+│ CDC command handler      │          │ CW carrier (TUNE mode)   │
+│ Status push to GUI       │          │                          │
+└──────────────────────────┘          └──────────────────────────┘
+```
 
 ## Wiring Diagram
+
+See [WIRING.txt](WIRING.txt) for detailed visual diagrams.
 
 ```
 Raspberry Pi Pico 2          LoRa1280F27-TCXO Module
@@ -61,11 +91,19 @@ GPIO 22            ───────── TCXO_EN
 GPIO 14            ───────── RX_EN
 GPIO 15            ───────── TX_EN
 
-VBUS (5V)          ───────── VCC
-GND                ───────── GND
+SSD1306 OLED (I2C1)          Encoder + Buttons
+================             ==================
+GPIO 6  (I2C1 SDA) ── SDA   GPIO 2  ── Encoder A
+GPIO 7  (I2C1 SCL) ── SCL   GPIO 3  ── Encoder B
+3V3                 ── VCC   GPIO 4  ── Encoder push (SW)
+GND                 ── GND   GPIO 5  ── PTT / CW key
 
+VBUS (5V)          ───────── VCC (LoRa module)
+GND                ───────── GND
 USB                ───────── To computer (Audio + CDC)
 ```
+
+All encoder/button inputs use internal pull-ups (active LOW).
 
 ### IMPORTANT - TCXO Module
 
@@ -116,8 +154,24 @@ cp SX1280SDR.uf2 /media/$USER/RPI-RP2/
 
 Run the GUI:
 ```bash
+pip install pyserial
 python3 gui.py
 ```
+
+Features:
+- **Live synchronization** — GUI updates in real-time when encoder/buttons change parameters on hardware
+- **RF & DSP tab** — Frequency (0.1 kHz precision), PPM, TX power, bandpass, EQ, compressor, power shaping
+- **Console tab** — Serial log, manual CDC commands
+- Auto-detection of SX1280 USB device
+
+### Standalone Operation
+
+The device operates fully without a computer:
+- Rotary encoder adjusts frequency (±100 Hz per step)
+- Short press toggles TUNE carrier
+- Long press enters parameter edit mode (browse with encoder, press to select)
+- PTT/KEY button for CW keying
+- OLED shows all status in real-time
 
 ### Carrier Mode
 If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
@@ -132,8 +186,11 @@ After connecting USB, a serial port is available with the following commands:
 |---------|-------------|
 | `help` | List commands |
 | `get` | Show current configuration |
+| `status` | Force status push to GUI (`!S` line) |
 | `diag` | SX1280 and buffer diagnostics |
 | `tx 0/1` | Enable/disable TX (SSB modulation) |
+| `mode usb/cw` | Set modulation mode |
+| `tune 0/1` | Toggle TUNE carrier |
 | `cw` | Start CW test |
 | `stop` | Stop CW transmission |
 
@@ -200,11 +257,14 @@ After connecting USB, a serial port is available with the following commands:
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency range | 2400.000 - 2400.500 MHz |
-| Output power | up to +27 dBm |
+| Frequency range | 2400.000 – 2400.500 MHz |
+| Output power | up to +27 dBm (adjustable -18…+13 dBm on chip) |
 | Modulation | SSB (USB), CW |
 | Audio sample rate | 48 kHz (USB) → 8 kHz (DSP) |
+| SPI clock | 18 MHz |
+| OLED | SSD1306 128×64, I2C1 @ 1 MHz, DMA transfer |
 | TCXO stability | ±0.5 ppm |
+| Frequency resolution | Sub-Hz (PLL steps + DSP fine offset) |
 
 ## QO-100 Uplink
 
@@ -213,6 +273,22 @@ QO-100 Narrowband Transponder:
 - **Downlink:** 10489.500 - 10490.000 MHz
 
 ## Changelog
+
+### v2.0.0
+- **OLED display** — SSD1306 128×64 via I2C1 with DMA (zero CPU during transfer)
+- **Rotary encoder** — Frequency tuning (±100 Hz), parameter browsing/editing
+- **CW keying** — PTT/KEY button with carrier state machine
+- **TUNE mode** — Toggle carrier via encoder push or CDC command
+- **GUI live sync** — Firmware pushes `!S` status lines on parameter change; GUI heartbeat ensures sync
+- **`status` command** — Force immediate status push for GUI synchronization
+- **Frequency formatting fix** — Bypasses newlib-nano scientific notation (`2.4e+09` → `2400000000.0`)
+- **GUI improvements:**
+  - Frequency entry in kHz with 0.1 kHz precision
+  - Removed scroll tune (replaced by hardware encoder)
+  - Adaptive polling (10ms when active, 50ms when idle)
+  - Status push coalescing — only latest `!S` applied per cycle
+  - Error logging for parse failures
+- **Reduced status push throttle** from 250ms to 100ms
 
 ### v1.5.0
 - **New feature:** Sub-Hz frequency precision via automatic PLL + DSP fine tuning
@@ -260,8 +336,10 @@ QO-100 Narrowband Transponder:
 
 ## TODO
 
+- [ ] Microphone input via ADC (standalone operation without computer)
 - [ ] Add preset system for saving/loading configurations
 - [ ] Add spectrum analyzer display in GUI
+- [ ] S-meter / audio level display on OLED
 
 ## Warning
 

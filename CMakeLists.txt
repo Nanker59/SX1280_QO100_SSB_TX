@@ -43,6 +43,7 @@ set(TINYUSB_FAMILY_DIR ${TINYUSB_DIR}/hw/bsp/rp2040)
 add_executable(SX1280SDR
     main.c
     usb_descriptors.c
+    ssd1306.c
 )
 
 pico_set_program_name(SX1280SDR "SX1280SDR")
@@ -59,6 +60,8 @@ target_link_libraries(SX1280SDR
             hardware_spi
         hardware_gpio
         hardware_clocks
+        hardware_i2c
+        hardware_dma
         pico_multicore
         hardware_pio
         hardware_pwm
