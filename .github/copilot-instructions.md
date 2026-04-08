@@ -3,9 +3,9 @@
 ## Project Overview
 
 SSB/CW transmitter for QO-100 satellite (Es'hail 2) using SX1280 module and Raspberry Pi Pico 2.
-USB Audio input from computer, real-time DSP processing, output via SX1280 RF chip.
+USB Audio or MAX4466 microphone input, real-time DSP processing, output via SX1280 RF chip.
 
-Key constraint: Dual-core real-time system - Core0 handles USB+DSP, Core1 handles radio TX at 8kHz rate.
+Key constraint: Dual-core real-time system - Core0 handles USB+DSP+MIC, Core1 handles radio TX at 8kHz rate.
 
 ## Tech Stack
 
@@ -23,17 +23,19 @@ Key constraint: Dual-core real-time system - Core0 handles USB+DSP, Core1 handle
 Core0 (USB + DSP Producer)          Core1 (Radio Consumer)
 ┌─────────────────────────┐         ┌─────────────────────────┐
 │ USB Audio @ 48kHz       │         │ Timer IRQ @ 8kHz        │
-│ Downsample 48k → 8k     │         │ Read from ring buffer   │
-│ DSP: BP → EQ → Comp     │ ──────► │ Hilbert transform       │
-│ Write to ring buffer    │         │ I/Q modulation          │
-│ CDC command handler     │         │ SX1280 SPI TX           │
+│   or MIC ADC @ 8kHz     │         │ Read from block buffer  │
+│ Downsample 48k → 8k    │         │ Hilbert transform       │
+│ DSP: BP → EQ → Comp    │ ──────► │ I/Q modulation          │
+│ MIC: AGC + noise gate   │         │ SX1280 SPI TX           │
+│ Write to block buffer   │         │                         │
+│ CDC command handler     │         │                         │
 └─────────────────────────┘         └─────────────────────────┘
 ```
 
-### Ring Buffer
+### Block Buffer
 
-- Size: 512 samples
-- Lock-free: single producer (Core0), single consumer (Core1)
+- Size: 256 samples × 8 blocks
+- Single producer (Core0), single consumer (Core1)
 - Adaptive resampling to balance buffer fill level
 
 ## Project Structure
@@ -41,8 +43,12 @@ Core0 (USB + DSP Producer)          Core1 (Radio Consumer)
 ```
 /
 ├── main.c                  # All application code
+├── ssd1306.c               # OLED display driver (I2C + DMA)
+├── ssd1306.h               # OLED driver header
 ├── usb_descriptors.c       # USB device descriptors
+├── usb_descriptors.h       # USB descriptor header
 ├── tusb_config.h           # TinyUSB configuration
+├── gui.py                  # Python GUI (tkinter + pyserial)
 ├── CMakeLists.txt          # Build configuration
 ├── pico_sdk_import.cmake   # SDK integration
 ├── external/
@@ -86,11 +92,25 @@ gpio_put(PIN_RESET, 1);
 
 ## DSP Pipeline
 
-### Signal Flow
+### Signal Flow (PC / USB Audio)
 
 ```
-Audio 48kHz → Downsample → Bandpass 300-2700Hz → Equalizer → Compressor → Ring Buffer
+Audio 48kHz → Downsample → Bandpass 300-2700Hz → Equalizer → Compressor → Block Buffer
 ```
+
+### Signal Flow (MIC / ADC)
+
+```
+ADC @ 8kHz (timer ISR) → DC removal (IIR HPF) → Ring buffer → AGC + Noise gate → DSP chain → Block Buffer
+```
+
+### MIC Subsystem
+
+- Hardware repeating timer ISR at 8 kHz reads ADC0
+- DC removal via IIR high-pass (α = 0.995) in ISR
+- Samples pushed to `mic_rb` ring buffer (int16_t, 1024 entries)
+- Main loop pops from `mic_rb`, applies AGC envelope follower + noise gate
+- Timer started/stopped on audio source switch (CDC `src` command, encoder, boot auto-switch)
 
 ### Filters
 
@@ -122,10 +142,15 @@ help              - List commands
 diag              - SX1280 diagnostics
 freq <Hz>         - Set center frequency
 ppm <value>       - PPM correction
+tx 0/1            - Enable/disable TX
+src pc|mic        - Switch audio source (PC=USB, MIC=ADC0)
 enable bp|eq|comp 0|1 - Enable/disable DSP blocks
 set bp_lo <Hz>    - Bandpass low cutoff
 set bp_hi <Hz>    - Bandpass high cutoff
 set comp_thr <dB> - Compressor threshold
+set mic_agc_target <0..1>  - AGC target level
+set mic_agc_max_gain <float> - AGC max gain
+set mic_gate_thresh <float>  - Noise gate threshold
 cw                - Start CW test
 stop              - Stop transmission
 ```

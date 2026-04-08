@@ -13,6 +13,7 @@
 #include "hardware/gpio.h"
 #include "hardware/clocks.h"
 #include "hardware/i2c.h"
+#include "hardware/adc.h"
 
 // TinyUSB
 #include "bsp/board_api.h"
@@ -116,6 +117,9 @@ static const uint32_t PIN_ENC_B   = 3;   // Encoder phase B
 static const uint32_t PIN_ENC_OK  = 4;   // Encoder push button
 static const uint32_t PIN_PTT_KEY = 5;   // PTT / CW key
 
+// ---------------- ADC microphone input ----------------
+static const uint32_t PIN_ADC_MIC = 26;  // ADC0 = GPIO26
+
 // ---------------- SPI config ----------------
 #define SX_SPI spi0
 static const uint32_t SX_SPI_BAUD = 18000000;
@@ -145,16 +149,17 @@ static volatile double g_target_freq_hz = (double)BASE_FREQ_HZ;
 static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
-static volatile uint8_t g_tx_enabled = 1;  // TX enable flag (for GUI TX button)
+static volatile uint8_t g_tx_enabled = 0;  // TX enable flag (for GUI TX button), default OFF
 static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
 static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
 static volatile uint8_t g_ptt_key = 0;     // 1 = PTT/KEY pressed (live)
+static volatile uint8_t g_audio_src = 0;   // 0 = PC (USB audio), 1 = MIC (ADC0)
 
 // --- Encoder UI state ---
 typedef enum {
     UI_PARAM_MODE = 0,   // USB / CW        (col 0, row 0)
     UI_PARAM_TUNE,       // TUNE on/off      (col 0, row 1)
-    UI_PARAM_MENU,       // MENU placeholder  (col 0, row 2)
+    UI_PARAM_SRC,        // PC / MIC          (col 0, row 2)
     UI_PARAM_TX,         // TX on/off        (col 1, row 0)
     UI_PARAM_PPM,        // PPM correction   (col 1, row 1)
     UI_PARAM_PWR,        // TX power dBm     (col 1, row 2)
@@ -249,6 +254,83 @@ static inline int16_t clamp16(int32_t x) {
     if (x > 32767) return 32767;
     if (x < -32768) return -32768;
     return (int16_t)x;
+}
+
+// ==========================================================
+// MIC ADC ring buffer + 8 kHz hardware timer
+// Timer ISR reads ADC, removes DC, pushes int16_t to mic_rb.
+// Main loop pops samples non-blocking (like USB path).
+// ==========================================================
+#define MIC_RB_SIZE 1024u  // Must be power-of-two
+#if (MIC_RB_SIZE & (MIC_RB_SIZE - 1u)) != 0
+#error "MIC_RB_SIZE must be power-of-two"
+#endif
+
+static int16_t g_mic_rb[MIC_RB_SIZE];
+static volatile uint32_t g_mic_w = 0;
+static volatile uint32_t g_mic_r = 0;
+
+static inline uint32_t mic_rb_next(uint32_t x) { return (x + 1u) & (MIC_RB_SIZE - 1u); }
+
+static inline bool mic_rb_push(int16_t s) {
+    uint32_t w = g_mic_w;
+    uint32_t n = mic_rb_next(w);
+    if (n == g_mic_r) return false; // full — drop
+    g_mic_rb[w] = s;
+    g_mic_w = n;
+    return true;
+}
+
+static inline bool mic_rb_pop(int16_t *out) {
+    uint32_t r = g_mic_r;
+    if (r == g_mic_w) return false; // empty
+    *out = g_mic_rb[r];
+    g_mic_r = mic_rb_next(r);
+    return true;
+}
+
+// Timer ISR: lightweight ADC read + DC removal at 8 kHz
+static bool mic_timer_callback(struct repeating_timer *t) {
+    (void)t;
+
+    // DC removal state (lives only in ISR context)
+    static float dc_prev_x = 0.0f;
+    static float dc_prev_y = 0.0f;
+    const float DC_ALPHA = 0.995f;
+
+    adc_select_input(0);
+    uint16_t raw = adc_read();
+    float x = ((float)raw - 2048.0f) / 2048.0f;  // Normalize to ±1.0
+
+    // DC removal (single-pole IIR HPF)
+    float y = x - dc_prev_x + DC_ALPHA * dc_prev_y;
+    dc_prev_x = x;
+    dc_prev_y = y;
+
+    // Scale to int16 and push to ring buffer
+    int16_t s = clamp16((int32_t)(y * 32767.0f));
+    mic_rb_push(s);
+
+    return true;  // keep repeating
+}
+
+static struct repeating_timer g_mic_timer;
+static volatile bool g_mic_timer_running = false;
+
+static void mic_timer_start(void) {
+    if (g_mic_timer_running) return;
+    // Flush ring buffer
+    g_mic_w = 0;
+    g_mic_r = 0;
+    // Negative period = exact interval (accounts for callback duration)
+    add_repeating_timer_us(-125, mic_timer_callback, NULL, &g_mic_timer);
+    g_mic_timer_running = true;
+}
+
+static void mic_timer_stop(void) {
+    if (!g_mic_timer_running) return;
+    cancel_repeating_timer(&g_mic_timer);
+    g_mic_timer_running = false;
 }
 
 // Read host audio (PCM16LE stereo), push to ringbuffer
@@ -348,6 +430,59 @@ static int16_t usb_audio_get_mono_8k(void) {
 
     float mono = (l + r) * 0.5f;
     return clamp16((int32_t)mono);
+}
+
+// ==========================================================
+// MIC audio: pop from timer-driven ring buffer + apply AGC/gate.
+// Analogous to usb_audio_get_mono_8k() but for ADC microphone.
+// DC removal is done in timer ISR; AGC + gate are done here
+// so they can use runtime-configurable params from cfg_local.
+// Returns float in ±1.0 range, or 0.0 if no sample available.
+// ==========================================================
+static float adc_mic_get_sample(float agc_target, float agc_max_gain,
+                                float agc_attack, float agc_release,
+                                float gate_thresh) {
+    // AGC: envelope follower + gain (persistent across calls)
+    static float agc_env = 0.0f;
+    static float agc_gain = 1.0f;
+
+    const float AGC_MIN_GAIN = 0.1f;
+
+    // Pop from mic ring buffer (filled by timer ISR)
+    int16_t raw16;
+    if (!mic_rb_pop(&raw16)) {
+        return 0.0f;  // No sample available — return silence
+    }
+
+    float y = (float)raw16 / 32767.0f;
+
+    // AGC envelope follower (peak detector)
+    float abs_y = (y >= 0.0f) ? y : -y;
+    if (abs_y > agc_env) {
+        agc_env += agc_attack * (abs_y - agc_env);
+    } else {
+        agc_env += agc_release * (abs_y - agc_env);
+    }
+
+    // Noise gate: if envelope is below threshold, output silence
+    if (agc_env < gate_thresh) {
+        return 0.0f;
+    }
+
+    // Compute gain from envelope
+    if (agc_env > 1e-6f) {
+        agc_gain = agc_target / agc_env;
+        if (agc_gain > agc_max_gain) agc_gain = agc_max_gain;
+        if (agc_gain < AGC_MIN_GAIN) agc_gain = AGC_MIN_GAIN;
+    }
+
+    float out = y * agc_gain;
+
+    // Hard limiter to prevent clipping
+    if (out > 1.0f) out = 1.0f;
+    if (out < -1.0f) out = -1.0f;
+
+    return out;
 }
 
 // ==========================================================
@@ -1016,6 +1151,13 @@ typedef struct {
 
     float amp_gain;
     float amp_min_a;
+
+    // MIC AGC (for ADC microphone input)
+    float mic_agc_target;    // Target envelope level (0..1)
+    float mic_agc_max_gain;  // Maximum gain (prevents noise pumping in silence)
+    float mic_agc_attack;    // Attack coefficient (0..1, higher = faster)
+    float mic_agc_release;   // Release coefficient (0..1, higher = faster)
+    float mic_gate_thresh;   // Noise gate threshold — below this, output is zero
 } audio_cfg_t;
 
 static volatile audio_cfg_t g_cfg = {
@@ -1042,6 +1184,12 @@ static volatile audio_cfg_t g_cfg = {
 
     .amp_gain  = AMP_GAIN,
     .amp_min_a = AMP_MIN_A,
+
+    .mic_agc_target   = 0.75f,
+    .mic_agc_max_gain = 1.0f,
+    .mic_agc_attack   = 0.01f,
+    .mic_agc_release  = 0.0001f,
+    .mic_gate_thresh  = 0.005f,   // Below this envelope, output is silenced
 };
 static volatile uint8_t g_cfg_dirty = 1;
 
@@ -1080,6 +1228,18 @@ static void cfg_sanitize(audio_cfg_t *c, float fs) {
 
     if (c->amp_gain < 0.01f) c->amp_gain = 0.01f;
     if (c->amp_min_a < 1e-9f) c->amp_min_a = 1e-9f;
+
+    // MIC AGC
+    if (c->mic_agc_target < 0.01f) c->mic_agc_target = 0.01f;
+    if (c->mic_agc_target > 1.0f) c->mic_agc_target = 1.0f;
+    if (c->mic_agc_max_gain < 1.0f) c->mic_agc_max_gain = 1.0f;
+    if (c->mic_agc_max_gain > 200.0f) c->mic_agc_max_gain = 200.0f;
+    if (c->mic_agc_attack < 0.0001f) c->mic_agc_attack = 0.0001f;
+    if (c->mic_agc_attack > 0.5f) c->mic_agc_attack = 0.5f;
+    if (c->mic_agc_release < 0.00001f) c->mic_agc_release = 0.00001f;
+    if (c->mic_agc_release > 0.1f) c->mic_agc_release = 0.1f;
+    if (c->mic_gate_thresh < 0.0f) c->mic_gate_thresh = 0.0f;
+    if (c->mic_gate_thresh > 0.5f) c->mic_gate_thresh = 0.5f;
 
     // Clamp bp_stages to valid range
     if (c->bp_stages < 1) c->bp_stages = 1;
@@ -1220,6 +1380,12 @@ static void cfg_print(void) {
         c.comp_thr_db, c.comp_ratio, c.comp_attack_ms, c.comp_release_ms, c.comp_makeup_db, c.comp_knee_db, c.comp_out_limit,
         c.amp_gain, c.amp_min_a
     );
+    cdc_printf(
+        "  mic_agc_target=%.3f mic_agc_max_gain=%.1f mic_agc_attack=%.4f mic_agc_release=%.5f\r\n"
+        "  mic_gate_thresh=%.4f  src=%s\r\n",
+        c.mic_agc_target, c.mic_agc_max_gain, c.mic_agc_attack, c.mic_agc_release,
+        c.mic_gate_thresh, g_audio_src ? "MIC" : "PC"
+    );
 }
 
 static void cmd_help(void) {
@@ -1230,6 +1396,7 @@ static void cmd_help(void) {
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
         "  mode usb|cw   - set modulation mode\r\n"
+        "  src pc|mic    - audio source (PC=USB audio, MIC=ADC0)\r\n"
         "  tune 0|1      - toggle TUNE carrier\r\n"
         "  cw            - start CW test transmission\r\n"
         "  stop          - stop CW transmission\r\n"
@@ -1253,6 +1420,11 @@ static void cmd_help(void) {
         "  set comp_outlim <0..1>\r\n"
         "  set amp_gain <float>\r\n"
         "  set amp_min_a <float>\r\n"
+        "  set mic_agc_target <0..1>   (MIC AGC target level)\r\n"
+        "  set mic_agc_max_gain <1..200> (MIC AGC max gain)\r\n"
+        "  set mic_agc_attack <coeff>  (MIC AGC attack speed)\r\n"
+        "  set mic_agc_release <coeff> (MIC AGC release speed)\r\n"
+        "  set mic_gate <0..0.5>       (noise gate threshold, 0=off)\r\n"
         "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
     );
@@ -1274,6 +1446,7 @@ static void cdc_status_push_ex(bool force) {
     static uint8_t  last_mode = 0xFF;
     static uint8_t  last_tune = 0xFF;
     static uint8_t  last_tx   = 0xFF;
+    static uint8_t  last_src  = 0xFF;
     static int8_t   last_pwr  = 127;
     static float    last_ppm  = 9999.0f;
     static double   last_freq = 0.0;
@@ -1283,6 +1456,7 @@ static void cdc_status_push_ex(bool force) {
     uint8_t  cur_mode = g_tx_mode;
     uint8_t  cur_tune = g_tune_active;
     uint8_t  cur_tx   = g_tx_enabled;
+    uint8_t  cur_src  = g_audio_src;
     int8_t   cur_pwr  = g_tx_power_max_dbm;
     float    cur_ppm  = g_ppm_correction;
     double   cur_freq = (double)g_target_freq_hz;
@@ -1290,7 +1464,8 @@ static void cdc_status_push_ex(bool force) {
     if (!force) {
         // Check if anything changed
         bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
-                       (cur_tx != last_tx) || (cur_pwr != last_pwr) ||
+                       (cur_tx != last_tx) || (cur_src != last_src) ||
+                       (cur_pwr != last_pwr) ||
                        (cur_ppm != last_ppm) || (cur_freq != last_freq);
 
         if (!changed) return;
@@ -1312,8 +1487,8 @@ static void cdc_status_push_ex(bool force) {
 
     char status_buf[128];
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
-             cur_mode, cur_tune, cur_tx, cur_pwr,
+             "!S mode=%u tune=%u tx=%u src=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
+             cur_mode, cur_tune, cur_tx, cur_src, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
              freq_str);
     cdc_write_str(status_buf);
@@ -1321,6 +1496,7 @@ static void cdc_status_push_ex(bool force) {
     last_mode = cur_mode;
     last_tune = cur_tune;
     last_tx   = cur_tx;
+    last_src  = cur_src;
     last_pwr  = cur_pwr;
     last_ppm  = cur_ppm;
     last_freq = cur_freq;
@@ -1356,6 +1532,22 @@ static void cdc_handle_line(char *line) {
             cdc_printf("OK mode=CW\r\n");
         } else {
             cdc_write_str("ERR: mode usb|cw\r\n");
+        }
+        return;
+    }
+
+    // Audio source: src pc|mic|adc
+    if (streqi(argv[0], "src") && argc >= 2) {
+        if (streqi(argv[1], "pc") || streqi(argv[1], "usb")) {
+            g_audio_src = 0;
+            mic_timer_stop();
+            cdc_printf("OK src=PC\r\n");
+        } else if (streqi(argv[1], "mic") || streqi(argv[1], "adc")) {
+            g_audio_src = 1;
+            mic_timer_start();
+            cdc_printf("OK src=MIC\r\n");
+        } else {
+            cdc_write_str("ERR: src pc|mic\r\n");
         }
         return;
     }
@@ -1478,6 +1670,11 @@ static void cdc_handle_line(char *line) {
         else if (streqi(argv[1], "comp_outlim")) c.comp_out_limit = f;
         else if (streqi(argv[1], "amp_gain"))    c.amp_gain = f;
         else if (streqi(argv[1], "amp_min_a"))   c.amp_min_a = f;
+        else if (streqi(argv[1], "mic_agc_target"))   c.mic_agc_target = f;
+        else if (streqi(argv[1], "mic_agc_max_gain")) c.mic_agc_max_gain = f;
+        else if (streqi(argv[1], "mic_agc_attack"))   c.mic_agc_attack = f;
+        else if (streqi(argv[1], "mic_agc_release"))  c.mic_agc_release = f;
+        else if (streqi(argv[1], "mic_gate"))         c.mic_gate_thresh = f;
         else { cdc_write_str("ERR: unknown key\r\n"); return; }
 
         cfg_commit(&c);
@@ -1590,6 +1787,24 @@ static void draw_radio_off_xy(int x, int y) {
     ssd1306_set_pixel(x+1, y+2, true); ssd1306_set_pixel(x+1, y+3, true);
 }
 
+// Forward declaration — defined below, after OLED drawing helpers
+static void oled_prepare_frame(void);
+
+// ==========================================================
+// Central OLED refresh — single rate-limited entry point.
+// Call this from any poll loop; it internally ensures:
+//  - DMA is finished before touching framebuffer
+//  - At most ~5 fps (200 ms between redraws)
+// ==========================================================
+static void oled_poll(void) {
+    static absolute_time_t oled_next = {0};
+    if (ssd1306_dma_busy()) return;
+    if (absolute_time_diff_us(get_absolute_time(), oled_next) > 0) return;
+    oled_prepare_frame();
+    ssd1306_display_dma(OLED_I2C);
+    oled_next = make_timeout_time_ms(200);
+}
+
 // Prepare framebuffer content (fast, no I2C)
 static void oled_prepare_frame(void) {
     double freq = g_target_freq_hz;
@@ -1672,8 +1887,8 @@ static void oled_prepare_frame(void) {
     // Row 1: TUNE
     DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
 
-    // Row 2: MENU (placeholder)
-    DRAW_L(ROW2_Y, "MENU", UI_PARAM_MENU);
+    // Row 2: Audio source (PC / MIC)
+    DRAW_L(ROW2_Y, g_audio_src ? "MIC" : "PC", UI_PARAM_SRC);
 
     // --- Column 1 (right) ---
     // Row 0: TX ON/OFF + radio icon
@@ -1801,8 +2016,9 @@ static void encoder_poll(void) {
                         // carrier_poll() will stop carrier (or keep idle if CW mode)
                     }
                     break;
-                case UI_PARAM_MENU:
-                    // Placeholder — no action yet
+                case UI_PARAM_SRC:
+                    g_audio_src = g_audio_src ? 0 : 1;
+                    if (g_audio_src) mic_timer_start(); else mic_timer_stop();
                     break;
                 case UI_PARAM_TX:
                     g_tx_enabled = g_tx_enabled ? 0 : 1;
@@ -2083,10 +2299,20 @@ static void core1_radio_apply_loop(void) {
 // USB audio pump (TinyUSB task + UAC RX read)
 // ==========================================================
 static void usb_audio_pump(void) {
-    // utrzymuj TinyUSB
-    tud_task();
-    // CDC command handling (if present)
-    cdc_task();
+    // utrzymuj TinyUSB — but rate-limit when no host is connected
+    // to avoid wasting CPU cycles polling dead USB PHY
+    static absolute_time_t tud_next = {0};
+    if (tud_connected()) {
+        tud_task();
+        cdc_task();
+    } else {
+        // No USB host — call tud_task() at reduced rate (every 10ms)
+        if (absolute_time_diff_us(get_absolute_time(), tud_next) <= 0) {
+            tud_task();
+            tud_next = make_timeout_time_ms(10);
+        }
+        return;  // No audio to read without USB host
+    }
 
     const uint32_t frame_bytes =
         (uint32_t)CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX *
@@ -2167,6 +2393,11 @@ int main(void) {
     // Initialize encoder last state
     enc_last_ab = ((gpio_get(PIN_ENC_A) ? 0 : 1) << 1) | (gpio_get(PIN_ENC_B) ? 0 : 1);
 
+    // --- ADC init for microphone input (ADC0 = GPIO26) ---
+    adc_init();
+    adc_gpio_init(PIN_ADC_MIC);
+    adc_select_input(0);  // ADC0
+
     spi_init(SX_SPI, SX_SPI_BAUD);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
@@ -2223,28 +2454,35 @@ int main(void) {
     // *** Start Core1 early so it can idle and drain blocks immediately ***
     multicore_launch_core1(core1_radio_apply_loop);
 
-    // Wait for USB — meanwhile handle encoder, buttons, OLED, CW keying
+    // Wait for USB — or timeout after 3 seconds (for powerbank / MIC-only use).
+    // Meanwhile handle encoder, buttons, OLED, CW keying.
     {
-        printf("[BOOT] Waiting for USB connection (encoder+CW active)...\n");
-        absolute_time_t oled_next = {0};
+        printf("[BOOT] Waiting for USB connection (max 3s, encoder+CW active)...\n");
+        absolute_time_t usb_deadline = make_timeout_time_ms(3000);
 
         while (!tud_ready()) {
             tud_task();
             encoder_poll();
             button_poll();
             carrier_poll();
+            oled_poll();
 
-            // OLED refresh during wait
-            if (!ssd1306_dma_busy() &&
-                absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
-                oled_prepare_frame();
-                ssd1306_display_dma(OLED_I2C);
-                oled_next = make_timeout_time_ms(200);
+            // Timeout: proceed without USB (powerbank / MIC-only mode)
+            if (absolute_time_diff_us(get_absolute_time(), usb_deadline) <= 0) {
+                printf("[BOOT] USB timeout — starting without USB host (MIC mode available)\n");
+                if (g_audio_src == 0) {
+                    g_audio_src = 1;  // Auto-switch to MIC if USB not present
+                    mic_timer_start();
+                    printf("[BOOT] Auto-switched to MIC audio source\n");
+                }
+                break;
             }
 
             sleep_ms(1);
         }
-        printf("[BOOT] USB connected, starting normal SSB mode\n");
+        if (tud_ready()) {
+            printf("[BOOT] USB connected, starting normal SSB mode\n");
+        }
     }
 
     hilbert_init();
@@ -2314,16 +2552,7 @@ int main(void) {
         // never executes, starving encoder/button/cw_keying polls.
         if (g_cw_test_mode) {
             usb_audio_pump();
-
-            {
-                static absolute_time_t oled_next_cw = {0};
-                if (!ssd1306_dma_busy() &&
-                    absolute_time_diff_us(get_absolute_time(), oled_next_cw) <= 0) {
-                    oled_prepare_frame();
-                    ssd1306_display_dma(OLED_I2C);
-                    oled_next_cw = make_timeout_time_ms(200);
-                }
-            }
+            oled_poll();
 
             encoder_poll();
             button_poll();
@@ -2339,20 +2568,7 @@ int main(void) {
 
         while (g_block_ready[b]) {
             usb_audio_pump();
-
-            // --- OLED update via DMA (zero CPU during transfer) ---
-            // Render + kick DMA during idle time. DMA feeds I2C TX FIFO
-            // in background — CPU is completely free for USB/DSP.
-            {
-                static absolute_time_t oled_next = {0};
-
-                if (!ssd1306_dma_busy() &&
-                    absolute_time_diff_us(get_absolute_time(), oled_next) <= 0) {
-                    oled_prepare_frame();
-                    ssd1306_display_dma(OLED_I2C);
-                    oled_next = make_timeout_time_ms(200);  // ~5 fps
-                }
-            }
+            oled_poll();
 
             // Poll encoder + buttons + carrier state machine
             encoder_poll();
@@ -2426,8 +2642,42 @@ int main(void) {
             if (sine_phase1 > 2.0f * (float)M_PI) sine_phase1 -= 2.0f * (float)M_PI;
 #endif
 #else
-            int16_t s = usb_audio_get_mono_8k();
-            x = (float)s / 32768.0f;
+            // Audio source: USB (PC) or ADC (MIC)
+            if (g_audio_src == 0) {
+                // PC mode: USB audio → downsample → mono
+                int16_t s = usb_audio_get_mono_8k();
+                x = (float)s / 32768.0f;
+            } else {
+                // MIC mode: wait for sample from timer-driven ring buffer.
+                // Timer ISR fills mic_rb at 8 kHz; we block here until a sample
+                // is available — this naturally paces Core0 at 8 kHz.
+                // While waiting, poll UI + refresh OLED so everything stays responsive.
+                // Also check g_audio_src: if user switches to PC mid-block,
+                // break out immediately to avoid deadlock (timer is stopped).
+                while (g_mic_r == g_mic_w) {
+                    if (g_audio_src == 0) break;  // Source switched — bail out
+                    usb_audio_pump();
+                    encoder_poll();
+                    button_poll();
+                    carrier_poll();
+                    oled_poll();
+#if CFG_TUD_CDC
+                    cdc_status_push();
+#endif
+                }
+                // If source changed mid-block, fill rest with silence
+                // If source changed mid-block, fill rest with silence
+                if (g_audio_src == 0) {
+                    x = 0.0f;
+                } else {
+                    x = adc_mic_get_sample(
+                        cfg_local.mic_agc_target,
+                        cfg_local.mic_agc_max_gain,
+                        cfg_local.mic_agc_attack,
+                        cfg_local.mic_agc_release,
+                        cfg_local.mic_gate_thresh);
+                }
+            }
 
             if (fabsf(x) < 1e-5f) {
                 if (silence_ctr < silence_samples) silence_ctr++;
@@ -2569,8 +2819,10 @@ int main(void) {
                 if (p_acc >= 1.0f && p_high != p_low) { p_chosen = p_high; p_acc -= 1.0f; }
             }
 
-            // Check global TX enable flag (from GUI TX button)
-            if (!g_tx_enabled) {
+            // SSB TX gating: transmit if GUI TX=ON *or* PTT pressed.
+            // Either source alone is sufficient (OR logic).
+            // CW mode PTT is handled separately by carrier_poll.
+            if (g_tx_mode == 0 && !g_tx_enabled && !g_ptt_key) {
                 tx_on = 0;
             }
 

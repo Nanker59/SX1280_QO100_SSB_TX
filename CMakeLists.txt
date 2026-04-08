@@ -62,6 +62,7 @@ target_link_libraries(SX1280SDR
         hardware_clocks
         hardware_i2c
         hardware_dma
+        hardware_adc
         pico_multicore
         hardware_pio
         hardware_pwm

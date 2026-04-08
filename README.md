@@ -20,14 +20,19 @@ The system uses a **dual-core architecture** — Core0 handles USB audio input a
 ### Features
 
 - **USB Audio** — Pico acts as USB sound card, audio input directly from computer
+- **Microphone input (ADC)** — MAX4466 electret module on ADC0, standalone TX without computer
+- **Audio source switching** — PC (USB) or MIC (ADC) selectable via encoder menu or GUI
+- **MIC DSP** — Hardware timer ISR at 8 kHz, DC removal, AGC with noise gate
 - **Real-time DSP** — Bandpass filter, equalizer, compressor, power shaping
 - **Sub-Hz frequency precision** — Automatic PLL + DSP fine tuning (no 198 Hz quantization)
-- **OLED display (SSD1306)** — Real-time status: frequency, mode, TX state, parameters
+- **OLED display (SSD1306)** — Real-time status: frequency, mode, TX state, audio source, parameters
 - **Rotary encoder + buttons** — Standalone operation without computer
+- **PTT** — Push-to-talk for SSB mode (GPIO5), OR with GUI TX enable
 - **CW keying** — Iambic-style keying with PTT/KEY button
 - **Python GUI** — Full control panel over CDC serial with live synchronization
 - **Output power up to +27 dBm** — Built-in PA in LoRa1280F27 module
 - **PPM correction** — Precise frequency calibration
+- **Powerbank operation** — Auto-detects missing USB host, switches to MIC input
 
 ## Author
 
@@ -43,6 +48,7 @@ Code generated with assistance from **Claude Opus 4** and **GPT 5.2**.
 |-----------|-------------|
 | Raspberry Pi Pico 2 | RP2350 microcontroller (dual Cortex-M33) |
 | LoRa1280F27-TCXO | SX1280 module with PA (+27 dBm) and TCXO |
+| MAX4466 microphone module | Electret mic with amplifier (3.3V powered) |
 | SSD1306 OLED 128×64 | I2C display (0.96") |
 | Rotary encoder with push button | KY-040 or similar (3-pin + SW) |
 | PTT / CW key button | Momentary pushbutton (normally open) |
@@ -64,12 +70,14 @@ Code generated with assistance from **Claude Opus 4** and **GPT 5.2**.
 Core0 (USB + DSP Producer)            Core1 (Radio Consumer)
 ┌──────────────────────────┐          ┌──────────────────────────┐
 │ USB Audio @ 48kHz        │          │ Timer IRQ @ 8kHz         │
-│ Downsample 48k → 8k     │          │ Read from block buffer   │
-│ DSP: BP → EQ → Comp     │ ───────► │ Hilbert transform        │
-│ Write to block buffer    │          │ I/Q modulation           │
-│ Encoder / button poll    │          │ SX1280 SPI TX            │
+│   or MIC ADC @ 8kHz      │          │ Read from block buffer   │
+│ Downsample 48k → 8k     │          │ Hilbert transform        │
+│ DSP: BP → EQ → Comp     │ ───────► │ I/Q modulation           │
+│ MIC: AGC + noise gate    │          │ SX1280 SPI TX            │
+│ Write to block buffer    │          │                          │
+│ Encoder / button poll    │          │ CW carrier (TUNE mode)   │
 │ OLED refresh via DMA     │          │                          │
-│ CDC command handler      │          │ CW carrier (TUNE mode)   │
+│ CDC command handler      │          │                          │
 │ Status push to GUI       │          │                          │
 └──────────────────────────┘          └──────────────────────────┘
 ```
@@ -97,6 +105,12 @@ GPIO 6  (I2C1 SDA) ── SDA   GPIO 2  ── Encoder A
 GPIO 7  (I2C1 SCL) ── SCL   GPIO 3  ── Encoder B
 3V3                 ── VCC   GPIO 4  ── Encoder push (SW)
 GND                 ── GND   GPIO 5  ── PTT / CW key
+
+MAX4466 Microphone
+==================
+GPIO 26 (ADC0)      ── OUT
+3V3                 ── VCC
+GND                 ── GND
 
 VBUS (5V)          ───────── VCC (LoRa module)
 GND                ───────── GND
@@ -166,12 +180,14 @@ Features:
 
 ### Standalone Operation
 
-The device operates fully without a computer:
+The device operates fully without a computer using the MAX4466 microphone:
 - Rotary encoder adjusts frequency (±100 Hz per step)
 - Short press toggles TUNE carrier
 - Long press enters parameter edit mode (browse with encoder, press to select)
-- PTT/KEY button for CW keying
+- Audio source selectable: PC (USB) or MIC (ADC) via parameter menu
+- PTT/KEY button for CW keying or SSB push-to-talk
 - OLED shows all status in real-time
+- Powered from USB powerbank — auto-switches to MIC input if no USB host detected within 3 seconds
 
 ### Carrier Mode
 If USB is not connected within 10 seconds of startup, the device automatically starts CW transmission on 2400.300 MHz at full power.
@@ -253,6 +269,18 @@ After connecting USB, a serial port is available with the following commands:
 |---------|-------------|
 | `txpwr <-18..13>` | Max TX power on SX1280 chip in dBm |
 
+### Audio Source & Microphone AGC
+
+| Command | Description |
+|---------|-------------|
+| `src pc` | Switch to PC (USB audio) input |
+| `src mic` | Switch to MIC (ADC0) input |
+| `set mic_agc_target <0..1>` | AGC target level (default 0.75) |
+| `set mic_agc_max_gain <1..200>` | AGC maximum gain (default 1.0) |
+| `set mic_agc_attack <float>` | AGC attack coefficient (default 0.01) |
+| `set mic_agc_release <float>` | AGC release coefficient (default 0.0001) |
+| `set mic_gate_thresh <float>` | Noise gate threshold (default 0.005) |
+
 ## Technical Specifications
 
 | Parameter | Value |
@@ -260,7 +288,9 @@ After connecting USB, a serial port is available with the following commands:
 | Frequency range | 2400.000 – 2400.500 MHz |
 | Output power | up to +27 dBm (adjustable -18…+13 dBm on chip) |
 | Modulation | SSB (USB), CW |
-| Audio sample rate | 48 kHz (USB) → 8 kHz (DSP) |
+| Audio input | USB 48 kHz (PC) or ADC 8 kHz (MAX4466 microphone) |
+| Audio sample rate | 48 kHz (USB) → 8 kHz (DSP); 8 kHz direct (MIC) |
+| MIC processing | Hardware timer ISR, DC removal, AGC with noise gate |
 | SPI clock | 18 MHz |
 | OLED | SSD1306 128×64, I2C1 @ 1 MHz, DMA transfer |
 | TCXO stability | ±0.5 ppm |
@@ -273,6 +303,19 @@ QO-100 Narrowband Transponder:
 - **Downlink:** 10489.500 - 10490.000 MHz
 
 ## Changelog
+
+### v2.1.0
+- **Microphone input (ADC)** — MAX4466 electret module on ADC0 (GPIO26), hardware timer ISR at 8 kHz
+- **Audio source switching** — PC (USB) or MIC (ADC) via encoder parameter menu, GUI radiobuttons, or `src pc|mic` CDC command
+- **MIC AGC with noise gate** — Configurable target level, max gain, attack/release, gate threshold
+- **PTT for SSB** — GPIO5 push-to-talk in SSB mode; TX enabled by GUI TX ON *or* PTT press
+- **Powerbank operation** — 3s USB host timeout, auto-switch to MIC input; rate-limited USB polling without host
+- **OLED stability fix** — Centralized single `oled_poll()` replaces 4 independent render timers; eliminates framebuffer corruption during DMA
+- **Default TX OFF** — TX disabled on boot for safety (was enabled in v2.0.0)
+- **GUI improvements:**
+  - Audio source (PC/MIC) radiobuttons with live sync
+  - MIC AGC control panel (5 sliders: target, max gain, attack, release, gate threshold)
+  - TX defaults to OFF on connect
 
 ### v2.0.0
 - **OLED display** — SSD1306 128×64 via I2C1 with DMA (zero CPU during transfer)
@@ -336,10 +379,10 @@ QO-100 Narrowband Transponder:
 
 ## TODO
 
-- [ ] Microphone input via ADC (standalone operation without computer)
 - [ ] Add preset system for saving/loading configurations
 - [ ] Add spectrum analyzer display in GUI
 - [ ] S-meter / audio level display on OLED
+- [ ] VOX (voice-activated TX) for MIC mode
 
 ## Warning
 

@@ -2,8 +2,8 @@
         WIRING DIAGRAM: Raspberry Pi Pico 2 ↔ LoRa1280F27-TCXO + Peripherals
 ================================================================================
 
-POWER SUPPLY: Module powered from VBUS (5V) - requires USB connected to Pico
-OLED and encoder powered from 3V3(OUT).
+POWER SUPPLY: LoRa module powered from VBUS (5V).
+OLED, encoder and microphone module powered from 3V3(OUT).
 
 ================================================================================
 VISUAL DIAGRAM
@@ -101,6 +101,27 @@ OLED DISPLAY (SSD1306 128×64, I2C1)
     Display refresh: ~5 fps via DMA (zero CPU during I2C transfer)
 
 ================================================================================
+MICROPHONE MODULE (MAX4466 electret amplifier, ADC0)
+================================================================================
+
+         MAX4466 Module                      Raspberry Pi Pico
+        ┌───────────┐                        ┌──────────────────┐
+        │           │                        │                  │
+        │    VCC    │◄───────────────────────┤ 3V3(OUT)(Pin 36) │
+        │    GND    │◄───────────────────────┤ GND     (Pin 38) │
+        │    OUT    │───────────────────────►│ GPIO26  (Pin 31) │  ADC0
+        │           │                        │                  │
+        └───────────┘                        └──────────────────┘
+
+    Powered from 3.3V (module accepts 2.4–5.5V).
+    Gain adjustable via trim pot on module (default ~25x, max ~125x).
+    Output: analog ~0.1–3.2V centered around VCC/2 ≈ 1.65V.
+    ADC samples at 8 kHz via hardware repeating timer (ISR).
+    DC offset removed by high-pass IIR filter (α = 0.995) in ISR.
+
+    Audio source selectable: PC (USB) or MIC (ADC) via encoder menu or GUI.
+
+================================================================================
 GPIO SUMMARY
 ================================================================================
 
@@ -130,6 +151,6 @@ GPIO SUMMARY
     GPIO 23  —  (free)
     GPIO 24  —  (free)
     GPIO 25  —  (free)
-    GPIO 26  —  ADC0 (reserved for future microphone input)
+    GPIO 26  —  ADC0 — Microphone input (MAX4466 module)
     GPIO 27  —  (free)
     GPIO 28  —  (free)

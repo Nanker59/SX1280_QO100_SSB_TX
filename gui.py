@@ -39,7 +39,7 @@ class TxConfig:
     freq_hz: float = 2_400_400_000.0
     ppm: float = 0.0
     tx_power_dbm: int = 13
-    tx_enabled: bool = True
+    tx_enabled: bool = False
     # Enables
     enable_bp: bool = True
     enable_eq: bool = True
@@ -64,6 +64,12 @@ class TxConfig:
     # Power shaping
     amp_gain: float = 2.9
     amp_min_a: float = 0.000002
+    # MIC AGC
+    mic_agc_target: float = 0.75
+    mic_agc_max_gain: float = 1.0
+    mic_agc_attack: float = 0.01
+    mic_agc_release: float = 0.0001
+    mic_gate_thresh: float = 0.005
 
 
 # ============================================================
@@ -323,8 +329,9 @@ class SX1280ControlApp(ttk.Frame):
         self.freq_khz_var = tk.StringVar(value=f"{self.config.freq_hz / 1000:.1f}")
         self.ppm_var = tk.DoubleVar(value=0.0)
         self.txpwr_var = tk.IntVar(value=self.config.tx_power_dbm)
-        self.tx_enabled_var = tk.BooleanVar(value=True)
+        self.tx_enabled_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value="usb")
+        self.src_var = tk.StringVar(value="pc")
         self.tune_var = tk.BooleanVar(value=False)
         self.en_bp_var = tk.BooleanVar(value=self.config.enable_bp)
         self.en_eq_var = tk.BooleanVar(value=self.config.enable_eq)
@@ -345,6 +352,11 @@ class SX1280ControlApp(ttk.Frame):
         self.comp_outlim_var = tk.DoubleVar(value=self.config.comp_out_limit)
         self.amp_gain_var = tk.DoubleVar(value=self.config.amp_gain)
         self.amp_min_a_var = tk.StringVar(value=f"{self.config.amp_min_a:.9f}")
+        self.mic_agc_target_var = tk.DoubleVar(value=self.config.mic_agc_target)
+        self.mic_agc_max_gain_var = tk.DoubleVar(value=self.config.mic_agc_max_gain)
+        self.mic_agc_attack_var = tk.DoubleVar(value=self.config.mic_agc_attack)
+        self.mic_agc_release_var = tk.DoubleVar(value=self.config.mic_agc_release)
+        self.mic_gate_thresh_var = tk.DoubleVar(value=self.config.mic_gate_thresh)
 
     # ----------------------------------------------------------
     def _build_ui(self):
@@ -406,6 +418,14 @@ class SX1280ControlApp(ttk.Frame):
                          value="usb", command=self._on_mode_change).pack(side="left", padx=5)
         ttk.Radiobutton(mt_inner, text="CW", variable=self.mode_var,
                          value="cw", command=self._on_mode_change).pack(side="left", padx=5)
+
+        ttk.Separator(mt_inner, orient="vertical").pack(side="left", fill="y", padx=15, pady=2)
+
+        ttk.Label(mt_inner, text="Src:").pack(side="left", padx=(0, 5))
+        ttk.Radiobutton(mt_inner, text="PC", variable=self.src_var,
+                         value="pc", command=self._on_src_change).pack(side="left", padx=5)
+        ttk.Radiobutton(mt_inner, text="MIC", variable=self.src_var,
+                         value="mic", command=self._on_src_change).pack(side="left", padx=5)
 
         ttk.Separator(mt_inner, orient="vertical").pack(side="left", fill="y", padx=15, pady=2)
 
@@ -565,6 +585,26 @@ class SX1280ControlApp(ttk.Frame):
                    command=lambda: self._send_cmd_safe(f"set amp_min_a {self.amp_min_a_var.get()}")
                   ).pack(side="left")
 
+        # === MIC AGC (ADC microphone input processing) ===
+        mic_frame = ttk.LabelFrame(tab, text="MIC AGC (ADC input)", padding=10)
+        mic_frame.grid(row=7, column=0, sticky="ew", pady=(0, 10))
+        mic_frame.columnconfigure(0, weight=1)
+        LabeledScale(mic_frame, "AGC target", self.mic_agc_target_var, 0.01, 1.0, 0.01,
+                     lambda v: self.debounced_send.call(f"set mic_agc_target {v:.3f}"),
+                     "{:.3f}").pack(fill="x")
+        LabeledScale(mic_frame, "AGC max gain", self.mic_agc_max_gain_var, 1.0, 200.0, 1.0,
+                     lambda v: self.debounced_send.call(f"set mic_agc_max_gain {v:.1f}"),
+                     "{:.1f}").pack(fill="x")
+        LabeledScale(mic_frame, "AGC attack", self.mic_agc_attack_var, 0.0001, 0.5, 0.0001,
+                     lambda v: self.debounced_send.call(f"set mic_agc_attack {v:.4f}"),
+                     "{:.4f}").pack(fill="x")
+        LabeledScale(mic_frame, "AGC release", self.mic_agc_release_var, 0.00001, 0.1, 0.00001,
+                     lambda v: self.debounced_send.call(f"set mic_agc_release {v:.5f}"),
+                     "{:.5f}").pack(fill="x")
+        LabeledScale(mic_frame, "Noise gate", self.mic_gate_thresh_var, 0.0, 0.5, 0.001,
+                     lambda v: self.debounced_send.call(f"set mic_gate {v:.4f}"),
+                     "{:.4f}").pack(fill="x")
+
     # ----------------------------------------------------------
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -684,6 +724,12 @@ class SX1280ControlApp(ttk.Frame):
             return
         mode = self.mode_var.get()
         self._send_cmd_safe(f"mode {mode}")
+
+    def _on_src_change(self):
+        if self._status_updating:
+            return
+        src = self.src_var.get()
+        self._send_cmd_safe(f"src {src}")
 
     def _toggle_tune(self):
         new_state = not self.tune_var.get()
@@ -850,6 +896,11 @@ class SX1280ControlApp(ttk.Frame):
                 new_mode = "cw" if kv["mode"] == "1" else "usb"
                 if self.mode_var.get() != new_mode:
                     self.mode_var.set(new_mode)
+
+            if "src" in kv:
+                new_src = "mic" if kv["src"] == "1" else "pc"
+                if self.src_var.get() != new_src:
+                    self.src_var.set(new_src)
 
             if "tune" in kv:
                 new_tune = kv["tune"] == "1"
