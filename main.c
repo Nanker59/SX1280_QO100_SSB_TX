@@ -150,10 +150,14 @@ static volatile float g_ppm_correction = 0.0f;
 static volatile uint8_t g_cw_test_mode = 0;  // 1 = CW test active (blocks normal Core1 operation)
 static volatile int8_t g_tx_power_max_dbm = PWR_MAX_DBM;  // Runtime TX power limit
 static volatile uint8_t g_tx_enabled = 0;  // TX enable flag (for GUI TX button), default OFF
-static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW
+static volatile uint8_t g_tx_mode = 0;     // 0 = USB (SSB), 1 = CW, 2 = FM
 static volatile uint8_t g_tune_active = 0; // 1 = TUNE carrier active
 static volatile uint8_t g_ptt_key = 0;     // 1 = PTT/KEY pressed (live)
 static volatile uint8_t g_audio_src = 0;   // 0 = PC (USB audio), 1 = MIC (ADC0)
+
+// --- FM mode parameters ---
+static volatile float g_fm_deviation_hz = 2500.0f;  // FM deviation in Hz (±, default NBFM)
+static volatile float g_ctcss_freq = 0.0f;          // CTCSS tone freq (0 = off)
 
 // --- Encoder UI state ---
 typedef enum {
@@ -185,6 +189,9 @@ static volatile uint32_t   g_ui_last_activity_ms = 0;      // for auto-timeout
 // --- PLL step ---
 static const float PLL_STEP_HZ =
     (float)(52000000.0 / (double)(1u << 18)); // ~198.364 Hz
+
+// --- FM modulation ---
+#define FM_DEVIATION_HZ     2500.0f  // ±2.5 kHz deviation (NBFM)
 
 #define F_OFF_LIMIT_HZ      3500.0f
 #define SILENCE_SECONDS     2u
@@ -882,12 +889,13 @@ static void sx_stop_cw(void) {
 // ==========================================================
 // Unified carrier state machine (runs on Core0 in polling loop)
 //
-// Inputs:  g_tx_mode (0=USB, 1=CW), g_tune_active, g_ptt_key
+// Inputs:  g_tx_mode (0=USB/SSB, 1=CW, 2=FM), g_tune_active, g_ptt_key
 // Outputs: g_cw_test_mode, SPI carrier on/off
 //
 // Logic:
 //   need_idle  = (g_tx_mode==1) || g_tune_active     → Core1 must idle
 //   need_carrier = g_tune_active || (g_tx_mode==1 && g_ptt_key)  → CW on
+//   FM mode (g_tx_mode==2) behaves like SSB — Core1 owns SPI, blocks flow.
 //
 // States:
 //   IDLE    → need_idle? set g_cw_test_mode=1, go ARMING
@@ -1364,7 +1372,8 @@ static void cfg_print(void) {
         "  mode=%s  tune=%s\r\n"
         "  corrected=%s Hz  base_steps=%lu  fine=%.1f Hz (auto)\r\n",
         freq_str, g_ppm_correction, g_tx_enabled ? "ON" : "OFF", g_tx_power_max_dbm,
-        g_tx_mode ? "CW" : "USB", g_tune_active ? "ON" : "OFF",
+        (g_tx_mode == 2) ? "FM" : (g_tx_mode == 1) ? "CW" : "USB",
+        g_tune_active ? "ON" : "OFF",
         corr_str, (unsigned long)get_base_steps(), fine);
     cdc_printf(
         "  enable bp=%u eq=%u comp=%u\r\n"
@@ -1382,9 +1391,11 @@ static void cfg_print(void) {
     );
     cdc_printf(
         "  mic_agc_target=%.3f mic_agc_max_gain=%.1f mic_agc_attack=%.4f mic_agc_release=%.5f\r\n"
-        "  mic_gate_thresh=%.4f  src=%s\r\n",
+        "  mic_gate_thresh=%.4f  src=%s\r\n"
+        "  fm_dev=%.0f Hz  ctcss=%.1f Hz\r\n",
         c.mic_agc_target, c.mic_agc_max_gain, c.mic_agc_attack, c.mic_agc_release,
-        c.mic_gate_thresh, g_audio_src ? "MIC" : "PC"
+        c.mic_gate_thresh, g_audio_src ? "MIC" : "PC",
+        g_fm_deviation_hz, g_ctcss_freq
     );
 }
 
@@ -1395,7 +1406,7 @@ static void cmd_help(void) {
         "  get\r\n"
         "  diag          - show SX1280 status\r\n"
         "  tx 0|1        - enable/disable TX (SSB modulation)\r\n"
-        "  mode usb|cw   - set modulation mode\r\n"
+        "  mode usb|cw|fm - set modulation mode\r\n"
         "  src pc|mic    - audio source (PC=USB audio, MIC=ADC0)\r\n"
         "  tune 0|1      - toggle TUNE carrier\r\n"
         "  cw            - start CW test transmission\r\n"
@@ -1425,6 +1436,8 @@ static void cmd_help(void) {
         "  set mic_agc_attack <coeff>  (MIC AGC attack speed)\r\n"
         "  set mic_agc_release <coeff> (MIC AGC release speed)\r\n"
         "  set mic_gate <0..0.5>       (noise gate threshold, 0=off)\r\n"
+        "  set fm_dev <200..100000>    (FM deviation in Hz)\r\n"
+        "  set ctcss <freq|0>          (CTCSS tone Hz, 0=off)\r\n"
         "\r\n"
         "Frequency is automatically split into PLL steps + fine DSP offset.\r\n"
     );
@@ -1450,6 +1463,8 @@ static void cdc_status_push_ex(bool force) {
     static int8_t   last_pwr  = 127;
     static float    last_ppm  = 9999.0f;
     static double   last_freq = 0.0;
+    static float    last_fm_dev = -1.0f;
+    static float    last_ctcss  = -1.0f;
 
     if (!tud_cdc_connected()) return;
 
@@ -1460,13 +1475,16 @@ static void cdc_status_push_ex(bool force) {
     int8_t   cur_pwr  = g_tx_power_max_dbm;
     float    cur_ppm  = g_ppm_correction;
     double   cur_freq = (double)g_target_freq_hz;
+    float    cur_fm_dev = g_fm_deviation_hz;
+    float    cur_ctcss  = g_ctcss_freq;
 
     if (!force) {
         // Check if anything changed
         bool changed = (cur_mode != last_mode) || (cur_tune != last_tune) ||
                        (cur_tx != last_tx) || (cur_src != last_src) ||
                        (cur_pwr != last_pwr) ||
-                       (cur_ppm != last_ppm) || (cur_freq != last_freq);
+                       (cur_ppm != last_ppm) || (cur_freq != last_freq) ||
+                       (cur_fm_dev != last_fm_dev) || (cur_ctcss != last_ctcss);
 
         if (!changed) return;
 
@@ -1485,12 +1503,21 @@ static void cdc_status_push_ex(bool force) {
     uint32_t ppm_frac = (uint32_t)((ppm_abs - (float)ppm_int) * 10000.0f + 0.5f);
     if (ppm_frac >= 10000) { ppm_int++; ppm_frac = 0; }
 
-    char status_buf[128];
+    char status_buf[160];
+    // fm_dev: format as integer (no fractional Hz needed)
+    uint32_t fm_dev_int = (uint32_t)(cur_fm_dev + 0.5f);
+    // ctcss: format as X.Y (one decimal place)
+    uint32_t ctcss_int = (uint32_t)cur_ctcss;
+    uint32_t ctcss_frac = (uint32_t)((cur_ctcss - (float)ctcss_int) * 10.0f + 0.5f);
+    if (ctcss_frac >= 10) { ctcss_int++; ctcss_frac = 0; }
+
     snprintf(status_buf, sizeof(status_buf),
-             "!S mode=%u tune=%u tx=%u src=%u pwr=%d ppm=%s%lu.%04lu freq=%s\r\n",
+             "!S mode=%u tune=%u tx=%u src=%u pwr=%d ppm=%s%lu.%04lu freq=%s fm_dev=%lu ctcss=%lu.%lu\r\n",
              cur_mode, cur_tune, cur_tx, cur_src, cur_pwr,
              ppm_neg ? "-" : "", (unsigned long)ppm_int, (unsigned long)ppm_frac,
-             freq_str);
+             freq_str,
+             (unsigned long)fm_dev_int,
+             (unsigned long)ctcss_int, (unsigned long)ctcss_frac);
     cdc_write_str(status_buf);
 
     last_mode = cur_mode;
@@ -1500,6 +1527,8 @@ static void cdc_status_push_ex(bool force) {
     last_pwr  = cur_pwr;
     last_ppm  = cur_ppm;
     last_freq = cur_freq;
+    last_fm_dev = cur_fm_dev;
+    last_ctcss  = cur_ctcss;
     last_push_ms = to_ms_since_boot(get_absolute_time());
 }
 
@@ -1522,7 +1551,7 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "cw"))   { g_tune_active = 1; cdc_printf("OK tune=ON (carrier_poll handles SPI)\r\n"); return; }
     if (streqi(argv[0], "stop")) { g_tune_active = 0; cdc_printf("OK tune=OFF\r\n"); return; }
 
-    // Mode: mode usb|cw
+    // Mode: mode usb|cw|fm
     if (streqi(argv[0], "mode") && argc >= 2) {
         if (streqi(argv[1], "usb") || streqi(argv[1], "ssb")) {
             g_tx_mode = 0;
@@ -1530,8 +1559,11 @@ static void cdc_handle_line(char *line) {
         } else if (streqi(argv[1], "cw")) {
             g_tx_mode = 1;
             cdc_printf("OK mode=CW\r\n");
+        } else if (streqi(argv[1], "fm")) {
+            g_tx_mode = 2;
+            cdc_printf("OK mode=FM\r\n");
         } else {
-            cdc_write_str("ERR: mode usb|cw\r\n");
+            cdc_write_str("ERR: mode usb|cw|fm\r\n");
         }
         return;
     }
@@ -1581,8 +1613,8 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "freq") && argc >= 2) {
         char *e = NULL;
         double f = strtod(argv[1], &e);
-        if (e == argv[1] || f < 2400000000.0 || f > 2500000000.0) {
-            cdc_write_str("ERR: freq must be 2400000000-2500000000 Hz\r\n");
+        if (e == argv[1] || f < 2300000000.0 || f > 2500000000.0) {
+            cdc_write_str("ERR: freq must be 2300000000-2500000000 Hz\r\n");
             return;
         }
         g_target_freq_hz = f;
@@ -1653,6 +1685,22 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "set") && argc >= 3) {
         float f;
         if (!parse_f(argv[2], &f)) { cdc_write_str("ERR: bad number\r\n"); return; }
+
+        // FM deviation and CTCSS are volatile globals, not in audio_cfg_t
+        if (streqi(argv[1], "fm_dev")) {
+            if (f < 200.0f) f = 200.0f;
+            if (f > 100000.0f) f = 100000.0f;
+            g_fm_deviation_hz = f;
+            cdc_printf("OK fm_dev=%.0f Hz\r\n", g_fm_deviation_hz);
+            return;
+        }
+        if (streqi(argv[1], "ctcss")) {
+            if (f < 0.0f) f = 0.0f;
+            if (f > 300.0f) f = 300.0f;
+            g_ctcss_freq = f;
+            cdc_printf("OK ctcss=%.1f Hz\r\n", g_ctcss_freq);
+            return;
+        }
 
         if      (streqi(argv[1], "bp_lo"))       c.bp_lo_hz = f;
         else if (streqi(argv[1], "bp_hi"))       c.bp_hi_hz = f;
@@ -1827,8 +1875,9 @@ static void oled_prepare_frame(void) {
     }
 
     // --- Row 1 (pages 2-3): ↓ arrow + right-justified downlink freq ---
-    draw_arrow_down_2x(0, 2);
-    {
+    // Only show downlink when inside QO-100 NB transponder (2400.0–2400.5 MHz)
+    if (freq >= 2400000000.0 && freq <= 2400500000.0) {
+        draw_arrow_down_2x(0, 2);
         char buf[20];
         uint32_t khz_total = (uint32_t)(downlink / 1000.0);
         uint32_t frac = (uint32_t)((downlink - (double)khz_total * 1000.0) / 100.0 + 0.5);
@@ -1882,7 +1931,7 @@ static void oled_prepare_frame(void) {
 
     // --- Column 0 (left) ---
     // Row 0: Mode (USB / CW)
-    DRAW_L(ROW0_Y, g_tx_mode ? "CW" : "USB", UI_PARAM_MODE);
+    DRAW_L(ROW0_Y, (g_tx_mode == 2) ? "FM" : (g_tx_mode == 1) ? "CW" : "USB", UI_PARAM_MODE);
 
     // Row 1: TUNE
     DRAW_L(ROW1_Y, g_tune_active ? "TUNE *" : "TUNE", UI_PARAM_TUNE);
@@ -1984,7 +2033,7 @@ static void encoder_poll(void) {
             // Default: encoder adjusts frequency
             {
                 double f = g_target_freq_hz + step * ENC_FREQ_STEP_HZ;
-                if (f < 2400000000.0) f = 2400000000.0;
+                if (f < 2300000000.0) f = 2300000000.0;
                 if (f > 2500000000.0) f = 2500000000.0;
                 g_target_freq_hz = f;
                 if (g_tune_active) tune_apply_settings();
@@ -2005,7 +2054,12 @@ static void encoder_poll(void) {
             // Adjust value of selected param
             switch (g_ui_editing) {
                 case UI_PARAM_MODE:
-                    g_tx_mode = g_tx_mode ? 0 : 1;
+                    // Cycle: USB(0) → CW(1) → FM(2) → USB(0)
+                    if (step > 0) {
+                        g_tx_mode = (g_tx_mode + 1) % 3;
+                    } else {
+                        g_tx_mode = (g_tx_mode + 2) % 3;  // reverse
+                    }
                     break;
                 case UI_PARAM_TUNE:
                     if (step > 0 && !g_tune_active) {
@@ -2492,6 +2546,7 @@ int main(void) {
     float theta_prev = 0.0f;
     float f_acc = 0.0f;
     float fine_tune_phase = 0.0f;  // Phase accumulator for fine frequency tuning
+    float ctcss_phase = 0.0f;     // Phase accumulator for CTCSS tone generator
 
     float p_acc = 0.0f;
     float tx_acc = 0.0f;
@@ -2733,6 +2788,52 @@ int main(void) {
             }
 #endif
 
+            // ==================== FM MODE ====================
+            // Direct frequency modulation: audio sample → frequency offset.
+            // No Hilbert transform, no SSB I/Q, no amplitude shaping.
+            // Constant power, constant TX on (when gated).
+            if (g_tx_mode == 2) {
+                // x is ±1.0 after DSP chain
+                // Add CTCSS sub-audible tone if enabled
+                if (g_ctcss_freq > 0.0f) {
+                    float ctcss_amp = 0.15f;  // ~15% of deviation (standard)
+                    x = x * (1.0f - ctcss_amp) + ctcss_amp * sinf(ctcss_phase);
+                    ctcss_phase += 2.0f * (float)M_PI * g_ctcss_freq / Fs;
+                    if (ctcss_phase >= 2.0f * (float)M_PI) ctcss_phase -= 2.0f * (float)M_PI;
+                }
+                float fm_offset_hz = x * g_fm_deviation_hz;
+                float fm_steps = fm_offset_hz / PLL_STEP_HZ;
+                int32_t fm_int = (int32_t)floorf(fm_steps);
+                float fm_frac = fm_steps - (float)fm_int;
+
+                // Sigma-delta dithering for fractional step
+                f_acc += fm_frac;
+                int32_t fm_chosen = fm_int;
+                if (f_acc >= 1.0f)       { fm_chosen += 1; f_acc -= 1.0f; }
+                else if (f_acc <= -1.0f)  { fm_chosen -= 1; f_acc += 1.0f; }
+
+                int32_t cur_steps = base_steps + fm_chosen;
+
+                // Apply fine frequency tuning (sub-PLL-step correction)
+                float fine_hz = get_fine_tune_hz();
+                if (fine_hz != 0.0f) {
+                    float fine_steps = fine_hz / PLL_STEP_HZ;
+                    cur_steps += (int32_t)roundf(fine_steps);
+                }
+
+                int8_t pwr_max = g_tx_power_max_dbm;
+                uint8_t tx_on = 1;
+
+                // FM TX gating: same OR logic as SSB
+                if (!g_tx_enabled && !g_ptt_key) tx_on = 0;
+
+                blk[n].freq_steps = cur_steps;
+                blk[n].p_dbm      = pwr_max;
+                blk[n].tx_on      = tx_on;
+                continue;  // Skip SSB path below
+            }
+
+            // ==================== SSB MODE ====================
             float I;
             float Q = hilbert_process(x, &I);
 

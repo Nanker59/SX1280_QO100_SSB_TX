@@ -297,9 +297,13 @@ class ScrollableFrame(ttk.Frame):
 # ============================================================
 
 class SX1280ControlApp(ttk.Frame):
-    FREQ_MIN_HZ = 2_400_000_000
-    FREQ_MAX_HZ = 2_400_500_000
+    FREQ_MIN_HZ = 2_300_000_000
+    FREQ_MAX_HZ = 2_500_000_000
     FREQ_STEP_HZ = 100
+
+    # QO-100 narrowband transponder limits
+    QO100_MIN_HZ = 2_400_000_000
+    QO100_MAX_HZ = 2_400_500_000
 
     def __init__(self, master):
         super().__init__(master)
@@ -331,6 +335,7 @@ class SX1280ControlApp(ttk.Frame):
         self.txpwr_var = tk.IntVar(value=self.config.tx_power_dbm)
         self.tx_enabled_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value="usb")
+        self.full_band_var = tk.BooleanVar(value=False)
         self.src_var = tk.StringVar(value="pc")
         self.tune_var = tk.BooleanVar(value=False)
         self.en_bp_var = tk.BooleanVar(value=self.config.enable_bp)
@@ -357,6 +362,8 @@ class SX1280ControlApp(ttk.Frame):
         self.mic_agc_attack_var = tk.DoubleVar(value=self.config.mic_agc_attack)
         self.mic_agc_release_var = tk.DoubleVar(value=self.config.mic_agc_release)
         self.mic_gate_thresh_var = tk.DoubleVar(value=self.config.mic_gate_thresh)
+        self.fm_dev_var = tk.DoubleVar(value=2500.0)
+        self.ctcss_var = tk.StringVar(value="Off")
 
     # ----------------------------------------------------------
     def _build_ui(self):
@@ -418,6 +425,8 @@ class SX1280ControlApp(ttk.Frame):
                          value="usb", command=self._on_mode_change).pack(side="left", padx=5)
         ttk.Radiobutton(mt_inner, text="CW", variable=self.mode_var,
                          value="cw", command=self._on_mode_change).pack(side="left", padx=5)
+        ttk.Radiobutton(mt_inner, text="FM", variable=self.mode_var,
+                         value="fm", command=self._on_mode_change).pack(side="left", padx=5)
 
         ttk.Separator(mt_inner, orient="vertical").pack(side="left", fill="y", padx=15, pady=2)
 
@@ -447,6 +456,10 @@ class SX1280ControlApp(ttk.Frame):
         rf_frame = ttk.LabelFrame(tab, text="RF / Frequency", padding=10)
         rf_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         rf_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(rf_frame, text="Full Band (2300–2450 MHz)",
+                         variable=self.full_band_var,
+                         command=self._on_full_band_toggle).grid(row=0, column=0, columnspan=3, sticky="w")
 
         ttk.Label(rf_frame, text="Frequency:").grid(row=1, column=0, sticky="w")
         freq_slider_frame = ttk.Frame(rf_frame)
@@ -605,6 +618,45 @@ class SX1280ControlApp(ttk.Frame):
                      lambda v: self.debounced_send.call(f"set mic_gate {v:.4f}"),
                      "{:.4f}").pack(fill="x")
 
+        # === FM Settings ===
+        fm_frame = ttk.LabelFrame(tab, text="FM Settings", padding=10)
+        fm_frame.grid(row=8, column=0, sticky="ew", pady=(0, 10))
+        fm_frame.columnconfigure(0, weight=1)
+
+        CTCSS_TONES = [
+            "Off", "67.0", "69.3", "71.9", "74.4", "77.0", "79.7", "82.5",
+            "85.4", "88.5", "91.5", "94.8", "97.4", "100.0", "103.5", "107.2",
+            "110.9", "114.8", "118.8", "123.0", "127.3", "131.8", "136.5",
+            "141.3", "146.2", "151.4", "156.7", "162.2", "167.9", "173.8",
+            "179.9", "186.2", "192.8", "203.5", "206.5", "210.7", "218.1",
+            "225.7", "229.1", "233.6", "241.8", "250.3", "254.1",
+        ]
+
+        LabeledScale(fm_frame, "Deviation (Hz)", self.fm_dev_var, 200, 100000, 100,
+                     lambda v: self.debounced_send.call(f"set fm_dev {v:.0f}"),
+                     lambda v: f"{v:.0f} Hz").pack(fill="x")
+
+        ctcss_row = ttk.Frame(fm_frame)
+        ctcss_row.pack(fill="x", pady=(5, 0))
+        ttk.Label(ctcss_row, text="CTCSS Tone:", width=16, anchor="w").pack(side="left")
+        self.ctcss_combo = ttk.Combobox(ctcss_row, textvariable=self.ctcss_var,
+                                         values=CTCSS_TONES, state="readonly", width=10)
+        self.ctcss_combo.pack(side="left", padx=5)
+        self.ctcss_combo.bind("<<ComboboxSelected>>", self._on_ctcss_change)
+        ttk.Label(ctcss_row, text="Hz").pack(side="left")
+
+        # === Spectrum Analyzer (placeholder) ===
+        spec_frame = ttk.LabelFrame(tab, text="Spectrum Analyzer", padding=10)
+        spec_frame.grid(row=9, column=0, sticky="ew", pady=(0, 10))
+        spec_frame.columnconfigure(0, weight=1)
+
+        # Simple placeholder canvas; real FFT plotting will be added later
+        self.spec_canvas = tk.Canvas(spec_frame, height=120, bg="black")
+        self.spec_canvas.pack(fill="x")
+        self.spec_canvas.create_text(8, 60, anchor="w", fill="#cccccc",
+                                     text="Spectrum analyzer display (placeholder)")
+        ttk.Button(spec_frame, text="Refresh", command=lambda: self._send_cmd_safe("get")).pack(side="right", padx=5, pady=5)
+
     # ----------------------------------------------------------
     def _build_console_tab(self):
         tab = ttk.Frame(self.notebook, padding=10)
@@ -725,6 +777,32 @@ class SX1280ControlApp(ttk.Frame):
         mode = self.mode_var.get()
         self._send_cmd_safe(f"mode {mode}")
 
+    def _on_ctcss_change(self, _event=None):
+        if self._status_updating:
+            return
+        val = self.ctcss_var.get()
+        freq = "0" if val == "Off" else val
+        self._send_cmd_safe(f"set ctcss {freq}")
+
+    def _on_full_band_toggle(self):
+        full = self.full_band_var.get()
+        if full:
+            lo = self.FREQ_MIN_HZ
+            hi = self.FREQ_MAX_HZ
+        else:
+            lo = self.QO100_MIN_HZ
+            hi = self.QO100_MAX_HZ
+        self.freq_scale.configure(from_=lo / 1_000_000, to=hi / 1_000_000)
+        # Clamp current frequency into new range
+        try:
+            hz = float(self.freq_khz_var.get()) * 1000
+        except ValueError:
+            hz = self.config.freq_hz
+        hz = max(lo, min(hi, hz))
+        self.freq_khz_var.set(f"{hz / 1000:.1f}")
+        self.freq_mhz_var.set(hz / 1_000_000)
+        self._update_freq_display()
+
     def _on_src_change(self):
         if self._status_updating:
             return
@@ -768,8 +846,11 @@ class SX1280ControlApp(ttk.Frame):
         except ValueError:
             hz = self.config.freq_hz
         self.freq_mhz_label.config(text=f"{hz/1_000_000:.4f} MHz \u2191")
-        downlink_hz = hz + 8089_500_000
-        self.downlink_label.config(text=f"{downlink_hz/1_000_000:.4f} MHz \u2193")
+        if self.full_band_var.get():
+            self.downlink_label.config(text="")
+        else:
+            downlink_hz = hz + 8089_500_000
+            self.downlink_label.config(text=f"{downlink_hz/1_000_000:.4f} MHz \u2193")
 
     def _on_freq_slider(self, _val):
         if self._status_updating:
@@ -782,7 +863,11 @@ class SX1280ControlApp(ttk.Frame):
         self._send_cmd_safe(f"freq {hz}")
 
     def _clamp_freq(self, hz):
-        return max(self.FREQ_MIN_HZ, min(self.FREQ_MAX_HZ, hz))
+        if self.full_band_var.get():
+            lo, hi = self.FREQ_MIN_HZ, self.FREQ_MAX_HZ
+        else:
+            lo, hi = self.QO100_MIN_HZ, self.QO100_MAX_HZ
+        return max(lo, min(hi, hz))
 
     def _send_freq(self, hz):
         self._send_cmd_safe(f"freq {hz:.1f}")
@@ -893,7 +978,8 @@ class SX1280ControlApp(ttk.Frame):
             self._status_updating = True
 
             if "mode" in kv:
-                new_mode = "cw" if kv["mode"] == "1" else "usb"
+                mode_map = {"0": "usb", "1": "cw", "2": "fm"}
+                new_mode = mode_map.get(kv["mode"], "usb")
                 if self.mode_var.get() != new_mode:
                     self.mode_var.set(new_mode)
 
@@ -933,6 +1019,21 @@ class SX1280ControlApp(ttk.Frame):
                     self.freq_mhz_var.set(new_freq / 1_000_000)
                     self.freq_khz_var.set(f"{new_freq / 1000:.1f}")
                     self._update_freq_display()
+
+            if "fm_dev" in kv:
+                new_dev = float(kv["fm_dev"])
+                if abs(self.fm_dev_var.get() - new_dev) > 1.0:
+                    self.fm_dev_var.set(new_dev)
+
+            if "ctcss" in kv:
+                new_ctcss = float(kv["ctcss"])
+                if new_ctcss < 0.5:
+                    if self.ctcss_var.get() != "Off":
+                        self.ctcss_var.set("Off")
+                else:
+                    tone_str = f"{new_ctcss:.1f}"
+                    if self.ctcss_var.get() != tone_str:
+                        self.ctcss_var.set(tone_str)
 
             self._status_updating = False
         except Exception as e:
