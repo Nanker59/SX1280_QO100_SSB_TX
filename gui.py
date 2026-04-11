@@ -298,7 +298,7 @@ class ScrollableFrame(ttk.Frame):
 
 class SX1280ControlApp(ttk.Frame):
     FREQ_MIN_HZ = 2_300_000_000
-    FREQ_MAX_HZ = 2_500_000_000
+    FREQ_MAX_HZ = 2_450_000_000
     FREQ_STEP_HZ = 100
 
     # QO-100 narrowband transponder limits

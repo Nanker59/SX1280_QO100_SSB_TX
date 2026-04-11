@@ -28,7 +28,7 @@ The system uses a **dual-core architecture** — Core0 handles USB audio input a
 - **MIC DSP** — Hardware timer ISR at 8 kHz, DC removal, AGC with noise gate
 - **Real-time DSP** — Bandpass filter, equalizer, compressor, power shaping
 - **FM mode** — Direct frequency modulation with adjustable deviation (200 Hz – 100 kHz) and CTCSS tones (**⚠️ NOT for QO-100!**)
-- **Full Band operation** — Extended frequency range 2300–2500 MHz (QO-100 range + general 2.4 GHz)
+- **Full Band operation** — Extended frequency range 2300–2450 MHz (QO-100 range + general 2.4 GHz)
 - **Sub-Hz frequency precision** — Automatic PLL + DSP fine tuning (no 198 Hz quantization)
 - **OLED display (SSD1306)** — Real-time status: frequency, mode, TX state, audio source, parameters
 - **Rotary encoder + buttons** — Standalone operation without computer
@@ -301,7 +301,7 @@ Standard CTCSS tones from 67.0 to 254.1 Hz are supported. The tone is mixed at ~
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency range | 2300.000 – 2500.000 MHz (QO-100: 2400.000 – 2400.500 MHz) |
+| Frequency range | 2300.000 – 2450.000 MHz (QO-100: 2400.000 – 2400.500 MHz) |
 | Output power | up to +27 dBm (adjustable -18…+13 dBm on chip) |
 | Modulation | SSB (USB), CW, FM (with CTCSS) |
 | Audio input | USB 48 kHz (PC) or ADC 8 kHz (MAX4466 microphone) |
@@ -323,7 +323,7 @@ QO-100 Narrowband Transponder:
 ### v2.1.1
 - **FM mode** — Direct frequency modulation via PLL, deviation adjustable 200 Hz – 100 kHz (`set fm_dev <Hz>`)
 - **CTCSS tones** — 42 standard sub-audible tones (67.0–254.1 Hz), mixed at ~15% deviation level (`set ctcss <freq|0>`)
-- **Full Band operation** — Extended frequency range 2300–2500 MHz; GUI "Full Band" checkbox toggles between QO-100 (2400.0–2400.5) and full range
+- **Full Band operation** — Extended frequency range 2300–2450 MHz; GUI "Full Band" checkbox toggles between QO-100 (2400.0–2400.5) and full range
 - **GUI FM Settings panel** — Deviation slider + CTCSS combobox with all standard tones
 - **GUI Spectrum Analyzer** — Placeholder canvas (real FFT display planned for future release)
 - **OLED downlink hidden** — Downlink frequency row hidden when operating outside QO-100 range

@@ -162,7 +162,7 @@ Serial interface for configuration:
 ```
 help              - List commands
 diag              - SX1280 diagnostics
-freq <Hz>         - Set center frequency (2300000000–2500000000)
+freq <Hz>         - Set center frequency (2300000000–2450000000)
 ppm <value>       - PPM correction
 tx 0/1            - Enable/disable TX
 mode usb|cw|fm    - Set modulation mode (⚠️ FM not for QO-100!)
@@ -230,7 +230,7 @@ uint32_t steps = (uint32_t)(base_steps * ppm_factor);
 
 - Uplink: 2400.050 - 2400.300 MHz
 - Downlink: 10489.550 - 10489.800 MHz
-- Full band range (non-QO-100): 2300 - 2500 MHz
+- Full band range (non-QO-100): 2300 - 2450 MHz
 
 ## Common Issues
 

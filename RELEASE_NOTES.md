@@ -12,7 +12,7 @@ What's new in v2.1.1
   - FM now uses a runtime `g_fm_deviation_hz` (default 2500 Hz) instead of a fixed compile-time constant.
   - CDC status push includes `fm_dev` and `ctcss` fields for GUI sync.
   - Encoder UI cycles through USB → CW → FM.
-  - Full-band option: GUI + firmware allow operation from 2300–2500 MHz (use with caution & correct hardware).
+  - Full-band option: GUI + firmware allow operation from 2300–2450 MHz (use with caution & correct hardware).
 
 - GUI:
   - FM mode radio button and FM Settings panel (Deviation slider 200 Hz–100 kHz and CTCSS combobox).

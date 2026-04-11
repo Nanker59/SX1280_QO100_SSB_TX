@@ -1613,8 +1613,8 @@ static void cdc_handle_line(char *line) {
     if (streqi(argv[0], "freq") && argc >= 2) {
         char *e = NULL;
         double f = strtod(argv[1], &e);
-        if (e == argv[1] || f < 2300000000.0 || f > 2500000000.0) {
-            cdc_write_str("ERR: freq must be 2300000000-2500000000 Hz\r\n");
+        if (e == argv[1] || f < 2300000000.0 || f > 2450000000.0) {
+            cdc_write_str("ERR: freq must be 2300000000-2450000000 Hz\r\n");
             return;
         }
         g_target_freq_hz = f;
@@ -2034,7 +2034,7 @@ static void encoder_poll(void) {
             {
                 double f = g_target_freq_hz + step * ENC_FREQ_STEP_HZ;
                 if (f < 2300000000.0) f = 2300000000.0;
-                if (f > 2500000000.0) f = 2500000000.0;
+                if (f > 2450000000.0) f = 2450000000.0;
                 g_target_freq_hz = f;
                 if (g_tune_active) tune_apply_settings();
             }
