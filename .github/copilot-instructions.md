@@ -2,8 +2,10 @@
 
 ## Project Overview
 
-SSB/CW transmitter for QO-100 satellite (Es'hail 2) using SX1280 module and Raspberry Pi Pico 2.
+SSB/CW/FM transmitter for QO-100 satellite (Es'hail 2) and general 2.4 GHz amateur use, using SX1280 module and Raspberry Pi Pico 2.
 USB Audio or MAX4466 microphone input, real-time DSP processing, output via SX1280 RF chip.
+
+**⚠️ FM mode is NOT for QO-100!** The NB transponder is SSB/CW only.
 
 Key constraint: Dual-core real-time system - Core0 handles USB+DSP+MIC, Core1 handles radio TX at 8kHz rate.
 
@@ -133,6 +135,26 @@ float phase = atan2f(q_out, i_out);
 // Convert to SX1280 frequency steps with phase modulation
 ```
 
+### FM Modulation (Core0 block producer, g_tx_mode==2)
+
+```c
+// CTCSS sub-audible tone mixed into audio (if enabled)
+if (g_ctcss_freq > 0.0f) {
+    x = x * 0.85f + 0.15f * sinf(ctcss_phase);  // ~15% deviation
+    ctcss_phase += 2*PI * g_ctcss_freq / Fs;
+}
+// Direct frequency modulation: audio → PLL frequency offset
+float fm_offset_hz = x * g_fm_deviation_hz;
+float fm_steps = fm_offset_hz / PLL_STEP_HZ;
+// Sigma-delta dithering for fractional PLL step
+// Constant power, TX gating via OR(g_tx_enabled, g_ptt_key)
+// Bypasses Hilbert/SSB path entirely (continue after block fill)
+```
+
+- `g_fm_deviation_hz` — runtime adjustable, 200–100000 Hz (default 2500 = NBFM)
+- `g_ctcss_freq` — 0 = off, or standard tone 67.0–254.1 Hz
+- FM stays in CR_ST_IDLE (Core1 processes blocks like SSB, no carrier state machine)
+
 ## CDC Commands
 
 Serial interface for configuration:
@@ -140,9 +162,10 @@ Serial interface for configuration:
 ```
 help              - List commands
 diag              - SX1280 diagnostics
-freq <Hz>         - Set center frequency
+freq <Hz>         - Set center frequency (2300000000–2500000000)
 ppm <value>       - PPM correction
 tx 0/1            - Enable/disable TX
+mode usb|cw|fm    - Set modulation mode (⚠️ FM not for QO-100!)
 src pc|mic        - Switch audio source (PC=USB, MIC=ADC0)
 enable bp|eq|comp 0|1 - Enable/disable DSP blocks
 set bp_lo <Hz>    - Bandpass low cutoff
@@ -151,6 +174,8 @@ set comp_thr <dB> - Compressor threshold
 set mic_agc_target <0..1>  - AGC target level
 set mic_agc_max_gain <float> - AGC max gain
 set mic_gate_thresh <float>  - Noise gate threshold
+set fm_dev <200..100000>   - FM deviation in Hz
+set ctcss <freq|0>         - CTCSS tone Hz (0=off)
 cw                - Start CW test
 stop              - Stop transmission
 ```
@@ -205,6 +230,7 @@ uint32_t steps = (uint32_t)(base_steps * ppm_factor);
 
 - Uplink: 2400.050 - 2400.300 MHz
 - Downlink: 10489.550 - 10489.800 MHz
+- Full band range (non-QO-100): 2300 - 2500 MHz
 
 ## Common Issues
 

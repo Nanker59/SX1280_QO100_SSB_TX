@@ -1,6 +1,6 @@
 # SX1280 QO-100 SSB TX
 
-**SSB/CW transmitter for QO-100 satellite (Es'hail 2) with SX1280 + Raspberry Pi Pico 2**
+**SSB/CW/FM transmitter for QO-100 satellite (Es'hail 2) and 2.4 GHz band with SX1280 + Raspberry Pi Pico 2**
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
@@ -13,7 +13,10 @@
 
 ## Project Description
 
-SSB (Single Sideband) and CW transmitter for the 2.4 GHz band, designed for communication via the narrowband transponder of the geostationary satellite **QO-100 (Es'hail 2)**.
+SSB (Single Sideband), CW and FM transmitter for the 2.4 GHz band, designed for communication via the narrowband transponder of the geostationary satellite **QO-100 (Es'hail 2)** and general 2.4 GHz amateur operation.
+
+> **⚠️ WARNING: DO NOT transmit FM on the QO-100 narrowband transponder!**
+> The QO-100 NB transponder is for SSB/CW only. FM transmission will cause interference and is prohibited. Use FM mode only on appropriate amateur frequencies outside QO-100.
 
 The system uses a **dual-core architecture** — Core0 handles USB audio input and real-time DSP processing, while Core1 handles Hilbert transform, I/Q modulation and SX1280 SPI transmission at 8 kHz rate.
 
@@ -24,6 +27,8 @@ The system uses a **dual-core architecture** — Core0 handles USB audio input a
 - **Audio source switching** — PC (USB) or MIC (ADC) selectable via encoder menu or GUI
 - **MIC DSP** — Hardware timer ISR at 8 kHz, DC removal, AGC with noise gate
 - **Real-time DSP** — Bandpass filter, equalizer, compressor, power shaping
+- **FM mode** — Direct frequency modulation with adjustable deviation (200 Hz – 100 kHz) and CTCSS tones (**⚠️ NOT for QO-100!**)
+- **Full Band operation** — Extended frequency range 2300–2500 MHz (QO-100 range + general 2.4 GHz)
 - **Sub-Hz frequency precision** — Automatic PLL + DSP fine tuning (no 198 Hz quantization)
 - **OLED display (SSD1306)** — Real-time status: frequency, mode, TX state, audio source, parameters
 - **Rotary encoder + buttons** — Standalone operation without computer
@@ -205,7 +210,7 @@ After connecting USB, a serial port is available with the following commands:
 | `status` | Force status push to GUI (`!S` line) |
 | `diag` | SX1280 and buffer diagnostics |
 | `tx 0/1` | Enable/disable TX (SSB modulation) |
-| `mode usb/cw` | Set modulation mode |
+| `mode usb/cw/fm` | Set modulation mode (**⚠️ FM NOT for QO-100!**) |
 | `tune 0/1` | Toggle TUNE carrier |
 | `cw` | Start CW test |
 | `stop` | Stop CW transmission |
@@ -281,13 +286,24 @@ After connecting USB, a serial port is available with the following commands:
 | `set mic_agc_release <float>` | AGC release coefficient (default 0.0001) |
 | `set mic_gate_thresh <float>` | Noise gate threshold (default 0.005) |
 
+### FM Mode Settings
+
+> **⚠️ FM mode is for general 2.4 GHz amateur use only — DO NOT use FM on QO-100!**
+
+| Command | Description |
+|---------|-------------|
+| `set fm_dev <200..100000>` | FM deviation in Hz (default 2500, i.e. NBFM ±2.5 kHz) |
+| `set ctcss <freq\|0>` | CTCSS sub-audible tone in Hz (0 = off; e.g. `set ctcss 88.5`) |
+
+Standard CTCSS tones from 67.0 to 254.1 Hz are supported. The tone is mixed at ~15% of deviation (standard level).
+
 ## Technical Specifications
 
 | Parameter | Value |
 |-----------|-------|
-| Frequency range | 2400.000 – 2400.500 MHz |
+| Frequency range | 2300.000 – 2500.000 MHz (QO-100: 2400.000 – 2400.500 MHz) |
 | Output power | up to +27 dBm (adjustable -18…+13 dBm on chip) |
-| Modulation | SSB (USB), CW |
+| Modulation | SSB (USB), CW, FM (with CTCSS) |
 | Audio input | USB 48 kHz (PC) or ADC 8 kHz (MAX4466 microphone) |
 | Audio sample rate | 48 kHz (USB) → 8 kHz (DSP); 8 kHz direct (MIC) |
 | MIC processing | Hardware timer ISR, DC removal, AGC with noise gate |
@@ -303,6 +319,17 @@ QO-100 Narrowband Transponder:
 - **Downlink:** 10489.500 - 10490.000 MHz
 
 ## Changelog
+
+### v2.1.1
+- **FM mode** — Direct frequency modulation via PLL, deviation adjustable 200 Hz – 100 kHz (`set fm_dev <Hz>`)
+- **CTCSS tones** — 42 standard sub-audible tones (67.0–254.1 Hz), mixed at ~15% deviation level (`set ctcss <freq|0>`)
+- **Full Band operation** — Extended frequency range 2300–2500 MHz; GUI "Full Band" checkbox toggles between QO-100 (2400.0–2400.5) and full range
+- **GUI FM Settings panel** — Deviation slider + CTCSS combobox with all standard tones
+- **GUI Spectrum Analyzer** — Placeholder canvas (real FFT display planned for future release)
+- **OLED downlink hidden** — Downlink frequency row hidden when operating outside QO-100 range
+- **Encoder 3-way mode cycle** — USB → CW → FM → USB (both directions)
+- **Status push extended** — `fm_dev` and `ctcss` fields for GUI synchronization
+- **⚠️ WARNING: DO NOT transmit FM on QO-100!** The NB transponder is SSB/CW only.
 
 ### v2.1.0
 - **Microphone input (ADC)** — MAX4466 electret module on ADC0 (GPIO26), hardware timer ISR at 8 kHz
@@ -380,8 +407,8 @@ QO-100 Narrowband Transponder:
 ## TODO
 
 - [ ] Add preset system for saving/loading configurations
-- [ ] Add spectrum analyzer display in GUI
-- [ ] S-meter / audio level display on OLED
+- [ ] Spectrum analyzer — implement real FFT-based display in GUI (placeholder already in place)
+- [ ] GPSDO / 10 MHz reference input for improved frequency stability and accuracy
 - [ ] VOX (voice-activated TX) for MIC mode
 
 ## Warning
@@ -389,6 +416,8 @@ QO-100 Narrowband Transponder:
 **Transmission on 2.4 GHz requires appropriate radio license!**
 
 Make sure you have a valid amateur radio license and comply with regulations in your country.
+
+**⚠️ DO NOT transmit FM on the QO-100 narrowband transponder!** The QO-100 NB transponder is for SSB/CW only. FM transmission will cause interference and is prohibited. Use FM mode only outside the QO-100 transponder passband.
 
 ## License
 
