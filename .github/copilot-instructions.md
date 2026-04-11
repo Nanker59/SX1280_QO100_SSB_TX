@@ -238,3 +238,7 @@ uint32_t steps = (uint32_t)(base_steps * ppm_factor);
 2. **Frequency drift** - Adjust PPM correction
 3. **Audio clicks** - Check buffer underrun, adjust adaptive rate
 4. **Distortion** - Reduce amp_gain, check compressor settings
+
+## Hardware Test Notes
+
+- **SX1280 PLL lock range (LoRa1280F27-TCXO module)**: Tested stable synthesis from **2100 MHz to 2760 MHz** (datasheet says 2400–2500 MHz). Outside this range PLL did not lock or output was unreliable. The firmware limits are kept at 2300–2450 MHz for safety.
