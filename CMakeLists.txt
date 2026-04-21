@@ -66,6 +66,8 @@ target_link_libraries(SX1280SDR
         pico_multicore
         hardware_pio
         hardware_pwm
+        hardware_flash
+        pico_flash
         m
 
 )
@@ -114,5 +116,9 @@ target_sources(SX1280SDR PRIVATE
     ${TINYUSB_DIR}/src/portable/raspberrypi/rp2040/rp2040_usb.c
     ${TINYUSB_FAMILY_DIR}/family.c
 )
+
+# --------------------------------------------------------------------
+# codec2 — removed (FreeDV feature dropped)
+# --------------------------------------------------------------------
 
 pico_add_extra_outputs(SX1280SDR)
